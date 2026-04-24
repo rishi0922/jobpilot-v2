@@ -1,0 +1,140 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Job {
+  id            String   @id @default(cuid())
+  title         String
+  company       String
+  location      String?
+  sourceUrl     String   @unique
+  source        String   // linkedin, naukri, iimjobs, instahyre, hirist, wellfound, mnc
+  roleType      RoleType
+  description   String?
+  salary        String?
+  postedAt      DateTime?
+  scrapedAt     DateTime @default(now())
+  status        JobStatus @default(FOUND)
+  applyMode     ApplyMode @default(AUTO)
+  cvUsed        String?
+  appliedAt     DateTime?
+  lastUpdated   DateTime @updatedAt
+  matchScore    Int?     // 0-100 AI match score
+  matchNotes    String?  // AI analysis notes
+
+  applications  Application[]
+
+  @@index([roleType])
+  @@index([status])
+  @@index([source])
+  @@index([scrapedAt])
+}
+
+model Application {
+  id           String   @id @default(cuid())
+  jobId        String
+  job          Job      @relation(fields: [jobId], references: [id])
+  cvId         String
+  cv           CV       @relation(fields: [cvId], references: [id])
+  submittedAt  DateTime @default(now())
+  status       AppStatus @default(SUBMITTED)
+  errorLog     String?
+  formFields   Json?
+  responseNote String?
+
+  @@index([jobId])
+  @@index([status])
+}
+
+model CV {
+  id           String   @id @default(cuid())
+  roleType     RoleType @unique
+  fileName     String
+  fileUrl      String
+  version      Int      @default(1)
+  isActive     Boolean  @default(true)
+  uploadedAt   DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  analysisJson Json?    // cached AI analysis
+
+  applications Application[]
+}
+
+model Credential {
+  id          String   @id @default(cuid())
+  siteName    String   @unique
+  siteUrl     String
+  username    String
+  passwordEnc String   // AES-256 encrypted
+  isActive    Boolean  @default(true)
+  lastUsed    DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model ScraperRun {
+  id           String   @id @default(cuid())
+  startedAt    DateTime @default(now())
+  completedAt  DateTime?
+  jobsFound    Int      @default(0)
+  jobsApplied  Int      @default(0)
+  jobsFailed   Int      @default(0)
+  sources      String[] // which sources were scraped
+  errorsJson   Json?
+  status       RunStatus @default(RUNNING)
+}
+
+model CvAnalysis {
+  id           String   @id @default(cuid())
+  cvId         String
+  jobId        String?
+  analysisType String   // pre_application | post_application | general
+  matchScore   Int?
+  strengths    String[]
+  gaps         String[]
+  suggestions  String[]
+  keywords     String[]
+  createdAt    DateTime @default(now())
+}
+
+enum RoleType {
+  APM
+  PM
+  PROJECT_MANAGER
+  PROGRAM_MANAGER
+  BUSINESS_ANALYST
+}
+
+enum JobStatus {
+  FOUND
+  QUEUED
+  APPLIED
+  IN_REVIEW
+  INTERVIEW
+  REJECTED
+  FAILED
+  SKIPPED
+}
+
+enum AppStatus {
+  SUBMITTED
+  CONFIRMED
+  FAILED
+  PENDING
+}
+
+enum ApplyMode {
+  AUTO
+  MANUAL
+}
+
+enum RunStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
