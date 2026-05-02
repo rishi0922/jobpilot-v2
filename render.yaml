@@ -1,18 +1,12 @@
 services:
   - type: web
     name: jobpilot-scraper
-    runtime: python
+    runtime: docker
     rootDir: scripts
-    buildCommand: |
-      pip install -r requirements.txt
-      playwright install chromium
-      playwright install-deps chromium
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    dockerfilePath: ./Dockerfile
     plan: free
     envVars:
       - key: SCRAPER_API_KEY
         sync: false
       - key: NEXT_APP_URL
         sync: false
-      - key: PYTHON_VERSION
-        value: 3.11.0
