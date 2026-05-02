@@ -1,36 +1,90 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
 
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
+export const maxDuration = 60
+
+const ALL_SOURCES = ['naukri', 'linkedin', 'iimjobs', 'instahyre', 'hirist', 'wellfound', 'mnc']
+
 export async function POST(req: NextRequest) {
+  // Auth: allow either an API-key header (GitHub Action / CLI) or a same-origin
+  // request from the dashboard. The dashboard request is trusted because it
+  // hits the route from the same origin in a logged-in browser session; a
+  // public attacker would still need the API key.
+  const apiKey = req.headers.get('x-api-key')
+  const sameOrigin = (() => {
+    const origin = req.headers.get('origin')
+    const host = req.headers.get('host')
+    if (!origin || !host) return false
+    try {
+      return new URL(origin).host === host
+    } catch {
+      return false
+    }
+  })()
+
+  if (process.env.SCRAPER_API_KEY && apiKey !== process.env.SCRAPER_API_KEY && !sameOrigin) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
   const scraperUrl = process.env.SCRAPER_API_URL
   if (!scraperUrl) {
     return NextResponse.json({ error: 'SCRAPER_API_URL not configured' }, { status: 500 })
   }
 
+  let runId: string | null = null
   try {
-    // Create a run record
     const run = await prisma.scraperRun.create({
-      data: { status: 'RUNNING', sources: ['naukri', 'linkedin', 'iimjobs', 'instahyre', 'hirist', 'wellfound', 'mnc'] },
+      data: { status: 'RUNNING', sources: ALL_SOURCES },
     })
+    runId = run.id
 
-    // Kick off Python scraper (non-blocking)
-    fetch(`${scraperUrl}/scrape`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': process.env.SCRAPER_API_KEY! },
-      body: JSON.stringify({ sources: null }),
-    }).then(async (r) => {
-      const data = await r.json()
-      await prisma.scraperRun.update({
-        where: { id: run.id },
-        data: { status: 'COMPLETED', completedAt: new Date(), jobsFound: data.total || 0 },
+    // Kick off the Python scraper. The scraper accepts the request, returns
+    // immediately with 202, and finishes the work in the background — posting
+    // results back to /api/scraper/ingest. We MUST await the kick-off because
+    // Vercel terminates pending promises after the response is sent.
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 20000)
+    let kickedOff = false
+    try {
+      const res = await fetch(`${scraperUrl}/scrape`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.SCRAPER_API_KEY ?? '',
+        },
+        body: JSON.stringify({ runId: run.id, sources: null }),
+        signal: controller.signal,
       })
-    }).catch(async (e) => {
-      await prisma.scraperRun.update({ where: { id: run.id }, data: { status: 'FAILED', completedAt: new Date() } })
-      console.error('Scraper trigger failed:', e)
-    })
+      kickedOff = res.ok || res.status === 202
+      if (!kickedOff) {
+        const text = await res.text().catch(() => '')
+        throw new Error(`Scraper returned ${res.status}: ${text.slice(0, 200)}`)
+      }
+    } finally {
+      clearTimeout(timeout)
+    }
 
-    return NextResponse.json({ runId: run.id, message: 'Scraper started' })
-  } catch (err) {
-    return NextResponse.json({ error: 'Failed to start scraper' }, { status: 500 })
+    return NextResponse.json({ runId: run.id, message: 'Scraper started', sources: ALL_SOURCES })
+  } catch (err: any) {
+    console.error('Scraper trigger failed:', err)
+    if (runId) {
+      await prisma.scraperRun
+        .update({
+          where: { id: runId },
+          data: { status: 'FAILED', completedAt: new Date(), errorsJson: { message: String(err?.message || err) } },
+        })
+        .catch(() => {})
+    }
+    const isAbort = err?.name === 'AbortError'
+    return NextResponse.json(
+      {
+        error: isAbort
+          ? 'Scraper service did not respond within 20s (likely cold-starting on Render). Try again in 30 seconds.'
+          : `Failed to start scraper: ${err?.message || 'unknown error'}`,
+      },
+      { status: 502 }
+    )
   }
 }

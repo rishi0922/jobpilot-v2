@@ -1,6 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
 
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
+
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url)
@@ -34,13 +37,17 @@ export async function GET(req: NextRequest) {
 
 export async function PATCH(req: NextRequest) {
   try {
-    const { id, status, applyMode } = await req.json()
-    const updated = await prisma.job.update({
-      where: { id },
-      data: { status, applyMode, lastUpdated: new Date() },
-    })
+    const { id, status, applyMode, cvUsed } = await req.json()
+    if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 })
+    const data: any = { lastUpdated: new Date() }
+    if (status !== undefined) data.status = status
+    if (applyMode !== undefined) data.applyMode = applyMode
+    if (cvUsed !== undefined) data.cvUsed = cvUsed
+    if (status === 'APPLIED') data.appliedAt = new Date()
+    const updated = await prisma.job.update({ where: { id }, data })
     return NextResponse.json(updated)
-  } catch (err) {
-    return NextResponse.json({ error: 'Failed to update job' }, { status: 500 })
+  } catch (err: any) {
+    console.error('PATCH /api/jobs error:', err)
+    return NextResponse.json({ error: err?.message || 'Failed to update job' }, { status: 500 })
   }
 }

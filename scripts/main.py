@@ -4,7 +4,7 @@ FastAPI + Playwright based scraper for Indian job boards.
 Deploy on Render.com (free tier).
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -100,14 +100,15 @@ async def save_jobs(jobs: list[dict], run_id: str):
 def health():
     return {"status": "ok", "time": datetime.utcnow().isoformat()}
 
-@app.post("/scrape", dependencies=[Depends(verify_api_key)])
-async def run_scrape(sources: Optional[list[str]] = None):
-    """Trigger a full scrape across all enabled sources."""
-    enabled = sources or ["naukri", "linkedin", "iimjobs", "instahyre", "hirist", "wellfound", "mnc"]
-    run_id  = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+class ScrapeRequest(BaseModel):
+    sources: Optional[list[str]] = None
+    runId:   Optional[str]       = None
 
-    all_jobs   = []
-    seen_urls  = set()
+
+async def _run_full_scrape(enabled: list[str], run_id: str):
+    """Background worker that runs every enabled scraper and posts results back."""
+    all_jobs:   list[dict] = []
+    seen_urls:  set[str]   = set()
 
     async def run_source(name: str, coro):
         try:
@@ -142,16 +143,39 @@ async def run_scrape(sources: Optional[list[str]] = None):
     if "mnc" in enabled:
         tasks.append(run_source("mnc", scrape_mnc_sites()))
 
-    results = await asyncio.gather(*tasks)
-    for jobs in results:
-        all_jobs.extend(jobs)
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, list):
+                all_jobs.extend(r)
+            else:
+                print(f"[scrape] task error: {r}")
+    except Exception as e:
+        print(f"[scrape] gather failed: {e}")
 
     await save_jobs(all_jobs, run_id)
+    print(f"[scrape] {run_id} complete — {len(all_jobs)} jobs from {len(enabled)} sources")
+
+
+@app.post("/scrape", dependencies=[Depends(verify_api_key)], status_code=202)
+async def run_scrape(payload: ScrapeRequest, background: BackgroundTasks):
+    """
+    Trigger a full scrape. Returns immediately (202) and runs the scrape in the
+    background, posting results to NEXT_APP_URL/api/scraper/ingest when done.
+    This pattern is required because the caller (Vercel serverless) cannot wait
+    for a multi-minute scrape to complete.
+    """
+    enabled = payload.sources or [
+        "naukri", "linkedin", "iimjobs", "instahyre", "hirist", "wellfound", "mnc"
+    ]
+    run_id = payload.runId or f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+
+    background.add_task(_run_full_scrape, enabled, run_id)
 
     return {
         "runId":     run_id,
-        "total":     len(all_jobs),
         "sources":   enabled,
+        "status":    "accepted",
         "timestamp": datetime.utcnow().isoformat(),
     }
 
