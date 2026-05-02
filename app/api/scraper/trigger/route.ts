@@ -44,11 +44,30 @@ export async function POST(req: NextRequest) {
     // immediately with 202, and finishes the work in the background — posting
     // results back to /api/scraper/ingest. We MUST await the kick-off because
     // Vercel terminates pending promises after the response is sent.
+    //
+    // Render free-tier sleeps after 15 min of inactivity; cold-start takes
+    // 30-50s. We first ping /health to wake it up (with its own long-ish
+    // timeout), then send the actual /scrape request. Vercel maxDuration is
+    // 60s for this route, so total budget is tight but workable.
+    const baseUrl = scraperUrl.replace(/\/+$/, '') // strip trailing slashes
+
+    // Step 1: wake-up ping (best-effort, fail silently if it times out)
+    const wakeController = new AbortController()
+    const wakeTimeout = setTimeout(() => wakeController.abort(), 45000)
+    try {
+      await fetch(`${baseUrl}/health`, { signal: wakeController.signal })
+    } catch {
+      // ignore — we'll surface the error on the /scrape call below
+    } finally {
+      clearTimeout(wakeTimeout)
+    }
+
+    // Step 2: actual scrape kick-off
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 20000)
+    const timeout = setTimeout(() => controller.abort(), 12000)
     let kickedOff = false
     try {
-      const res = await fetch(`${scraperUrl}/scrape`, {
+      const res = await fetch(`${baseUrl}/scrape`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -81,7 +100,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(
       {
         error: isAbort
-          ? 'Scraper service did not respond within 20s (likely cold-starting on Render). Try again in 30 seconds.'
+          ? 'Scraper service did not respond in time. It is likely cold-starting on Render free tier — wait 60 seconds and try again.'
           : `Failed to start scraper: ${err?.message || 'unknown error'}`,
       },
       { status: 502 }
