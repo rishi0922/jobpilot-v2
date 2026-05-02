@@ -21,7 +21,7 @@ const ROLE_TYPES = [
   { value: 'BUSINESS_ANALYST', label: 'Business Analyst (BA)' },
 ]
 
-interface CredState { username: string; password: string; saved: boolean; showPwd: boolean }
+interface CredState { username: string; password: string; saved: boolean; showPwd: boolean; saving?: boolean; error?: string }
 
 export default function SettingsPage() {
   const [activeSection, setActiveSection] = useState<'credentials' | 'cvs' | 'mnc' | 'preferences'>('credentials')
@@ -48,15 +48,56 @@ export default function SettingsPage() {
         }
       })
       .catch(err => console.error('Failed to load CVs', err))
+
+    // Load saved-credential state so the badge reflects DB truth.
+    fetch('/api/credentials')
+      .then(res => res.json())
+      .then(data => {
+        if (Array.isArray(data)) {
+          setCreds(prev => {
+            const next = { ...prev }
+            for (const c of data) {
+              if (next[c.siteName]) {
+                next[c.siteName] = {
+                  ...next[c.siteName],
+                  username: c.username || next[c.siteName].username,
+                  saved: true,
+                }
+              }
+            }
+            return next
+          })
+        }
+      })
+      .catch(err => console.error('Failed to load credentials', err))
   }, [])
 
   function updateCred(site: string, field: string, val: any) {
-    setCreds(prev => ({ ...prev, [site]: { ...prev[site], [field]: val } }))
+    setCreds(prev => ({ ...prev, [site]: { ...prev[site], [field]: val, saved: false, error: undefined } }))
   }
 
-  function saveCred(site: string) {
-    setCreds(prev => ({ ...prev, [site]: { ...prev[site], saved: true } }))
-    // In production: POST /api/credentials with encrypted payload
+  async function saveCred(site: string) {
+    const c = creds[site]
+    const siteMeta = SITES.find(s => s.name === site)
+    if (!c || !siteMeta) return
+    setCreds(prev => ({ ...prev, [site]: { ...prev[site], saving: true, error: undefined } }))
+    try {
+      const res = await fetch('/api/credentials', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          siteName: site,
+          siteUrl: siteMeta.url,
+          username: c.username,
+          password: c.password,
+        }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || `Save failed (${res.status})`)
+      setCreds(prev => ({ ...prev, [site]: { ...prev[site], saved: true, saving: false, password: '' } }))
+    } catch (err: any) {
+      setCreds(prev => ({ ...prev, [site]: { ...prev[site], saving: false, error: err?.message || 'Save failed' } }))
+    }
   }
 
   async function handleCvUpload(role: string, e: React.ChangeEvent<HTMLInputElement>) {
@@ -165,11 +206,14 @@ export default function SettingsPage() {
                       </div>
                     </div>
                   </div>
-                  <button onClick={() => saveCred(site.name)}
-                    disabled={!c.username || !c.password}
-                    className="mt-3 text-xs font-medium px-4 py-2 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition-colors disabled:opacity-40">
-                    Save encrypted
-                  </button>
+                  <div className="mt-3 flex items-center gap-3">
+                    <button onClick={() => saveCred(site.name)}
+                      disabled={!c.username || !c.password || c.saving}
+                      className="text-xs font-medium px-4 py-2 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition-colors disabled:opacity-40">
+                      {c.saving ? 'Saving…' : 'Save encrypted'}
+                    </button>
+                    {c.error && <span className="text-xs text-red-600">{c.error}</span>}
+                  </div>
                 </div>
               )
             })}

@@ -1,6 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
 
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
+export const maxDuration = 60
+
 export async function POST(req: NextRequest) {
   const apiKey = req.headers.get('x-api-key')
   if (apiKey !== process.env.SCRAPER_API_KEY) {
@@ -42,15 +46,23 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Update scraper run log
-    await prisma.scraperRun.updateMany({
-      where: { status: 'RUNNING' },
-      data: {
-        jobsFound:   { increment: jobs.length },
-        jobsApplied: 0,
-        status:      'RUNNING',
-      },
-    })
+    // Update scraper run log — tag the specific run if we have its id, else
+    // touch all currently-RUNNING rows as a fallback.
+    if (runId) {
+      await prisma.scraperRun.updateMany({
+        where: { id: runId },
+        data: {
+          jobsFound: { increment: saved },
+          status: 'COMPLETED',
+          completedAt: new Date(),
+        },
+      })
+    } else {
+      await prisma.scraperRun.updateMany({
+        where: { status: 'RUNNING' },
+        data: { jobsFound: { increment: saved } },
+      })
+    }
 
     // Trigger applicator for AUTO mode jobs
     if (applyMode === 'AUTO') {

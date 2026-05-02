@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
 import { encrypt, decrypt } from '@/lib/crypto'
 
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
+
 export async function GET() {
   try {
     const creds = await prisma.credential.findMany({

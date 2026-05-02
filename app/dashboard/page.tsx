@@ -36,12 +36,21 @@ interface DashboardStats {
   interviews: number
   failed: number
   successRate: number
-  byRole: Array<{ role: string; found: number; applied: number; interviews: number }>
+  byRole: Array<{ role: string; found?: number; applied?: number; interviews?: number; count?: number }>
   bySource: Array<{ source: string; count: number }>
   byStatus: Array<{ status: string; count: number }>
   recentActivity: Array<{ date: string; applied: number; found: number }>
   lastScraperRun: string | null
-  scraperStatus: 'idle' | 'running' | 'failed'
+  scraperStatus: 'idle' | 'running' | 'failed' | 'RUNNING' | 'COMPLETED' | 'FAILED'
+}
+
+const EMPTY_STATS: DashboardStats = {
+  totalFound: 0, totalApplied: 0, inReview: 0, interviews: 0, failed: 0,
+  successRate: 0,
+  byRole: [], bySource: [], byStatus: [],
+  recentActivity: [],
+  lastScraperRun: null,
+  scraperStatus: 'idle',
 }
 
 interface Job {
@@ -59,52 +68,6 @@ interface Job {
   cvUsed: string | null
   applyMode: string
 }
-
-// ---- Mock data for Phase 1 preview ----
-const MOCK_STATS: DashboardStats = {
-  totalFound: 348, totalApplied: 214, inReview: 18, interviews: 5, failed: 12,
-  successRate: 2.3,
-  byRole: [
-    { role: 'APM', found: 82, applied: 54, interviews: 2 },
-    { role: 'PM', found: 110, applied: 72, interviews: 2 },
-    { role: 'Project Mgr', found: 64, applied: 38, interviews: 1 },
-    { role: 'Program Mgr', found: 48, applied: 28, interviews: 0 },
-    { role: 'BA', found: 44, applied: 22, interviews: 0 },
-  ],
-  bySource: [
-    { source: 'Naukri', count: 98 }, { source: 'LinkedIn', count: 87 },
-    { source: 'IIMJobs', count: 52 }, { source: 'MNC Sites', count: 44 },
-    { source: 'Hirist', count: 32 }, { source: 'Instahyre', count: 21 },
-    { source: 'Wellfound', count: 14 },
-  ],
-  byStatus: [
-    { status: 'APPLIED', count: 214 }, { status: 'IN_REVIEW', count: 18 },
-    { status: 'INTERVIEW', count: 5 }, { status: 'REJECTED', count: 32 },
-    { status: 'FAILED', count: 12 }, { status: 'FOUND', count: 67 },
-  ],
-  recentActivity: [
-    { date: 'Apr 15', applied: 28, found: 41 },
-    { date: 'Apr 16', applied: 35, found: 52 },
-    { date: 'Apr 17', applied: 22, found: 38 },
-    { date: 'Apr 18', applied: 41, found: 60 },
-    { date: 'Apr 19', applied: 18, found: 29 },
-    { date: 'Apr 20', applied: 38, found: 55 },
-    { date: 'Apr 21', applied: 32, found: 73 },
-  ],
-  lastScraperRun: '10 minutes ago',
-  scraperStatus: 'idle',
-}
-
-const MOCK_JOBS: Job[] = [
-  { id: '1', title: 'Associate Product Manager', company: 'Razorpay', location: 'Bengaluru', source: 'LinkedIn', roleType: 'APM', status: 'APPLIED', matchScore: 88, appliedAt: '2025-04-21T09:30:00Z', scrapedAt: '2025-04-21T09:00:00Z', sourceUrl: '#', cvUsed: 'APM CV', applyMode: 'AUTO' },
-  { id: '2', title: 'Product Manager – Fintech', company: 'Zepto', location: 'Mumbai', source: 'Naukri', roleType: 'PM', status: 'IN_REVIEW', matchScore: 74, appliedAt: '2025-04-20T14:00:00Z', scrapedAt: '2025-04-20T12:00:00Z', sourceUrl: '#', cvUsed: 'PM CV', applyMode: 'AUTO' },
-  { id: '3', title: 'Program Manager – IT', company: 'Infosys', location: 'Hyderabad', source: 'IIMJobs', roleType: 'PROGRAM_MANAGER', status: 'INTERVIEW', matchScore: 91, appliedAt: '2025-04-19T10:00:00Z', scrapedAt: '2025-04-19T08:00:00Z', sourceUrl: '#', cvUsed: 'Program Mgr CV', applyMode: 'AUTO' },
-  { id: '4', title: 'Business Analyst – Digital', company: 'Wipro', location: 'Remote', source: 'Wellfound', roleType: 'BUSINESS_ANALYST', status: 'FAILED', matchScore: 61, appliedAt: null, scrapedAt: '2025-04-21T08:00:00Z', sourceUrl: '#', cvUsed: null, applyMode: 'AUTO' },
-  { id: '5', title: 'Project Manager – Cloud', company: 'TCS', location: 'Pune', source: 'Hirist', roleType: 'PROJECT_MANAGER', status: 'APPLIED', matchScore: 79, appliedAt: '2025-04-21T07:00:00Z', scrapedAt: '2025-04-21T06:30:00Z', sourceUrl: '#', cvUsed: 'Project Mgr CV', applyMode: 'AUTO' },
-  { id: '6', title: 'APM – Growth', company: 'PhonePe', location: 'Bengaluru', source: 'LinkedIn', roleType: 'APM', status: 'FOUND', matchScore: 83, appliedAt: null, scrapedAt: '2025-04-21T11:00:00Z', sourceUrl: '#', cvUsed: null, applyMode: 'MANUAL' },
-  { id: '7', title: 'Senior PM – Payments', company: 'Paytm', location: 'Noida', source: 'Naukri', roleType: 'PM', status: 'FOUND', matchScore: 71, appliedAt: null, scrapedAt: '2025-04-21T10:30:00Z', sourceUrl: '#', cvUsed: null, applyMode: 'MANUAL' },
-  { id: '8', title: 'Product Manager', company: 'Amazon', location: 'Hyderabad', source: 'MNC Sites', roleType: 'PM', status: 'APPLIED', matchScore: 85, appliedAt: '2025-04-20T16:00:00Z', scrapedAt: '2025-04-20T15:00:00Z', sourceUrl: '#', cvUsed: 'PM CV', applyMode: 'AUTO' },
-]
 
 // ---- Components ----
 
@@ -142,8 +105,8 @@ function MatchScore({ score }: { score: number | null }) {
 }
 
 export default function Dashboard() {
-  const [stats] = useState<DashboardStats>(MOCK_STATS)
-  const [jobs, setJobs] = useState<Job[]>(MOCK_JOBS)
+  const [stats, setStats] = useState<DashboardStats>(EMPTY_STATS)
+  const [jobs, setJobs] = useState<Job[]>([])
   const [autoApply, setAutoApply] = useState(true)
   const [activeTab, setActiveTab] = useState<'overview' | 'jobs' | 'analysis'>('overview')
   const [filterRole, setFilterRole] = useState('')
@@ -151,7 +114,46 @@ export default function Dashboard() {
   const [filterStatus, setFilterStatus] = useState('')
   const [search, setSearch] = useState('')
   const [scraperRunning, setScraperRunning] = useState(false)
+  const [scraperMessage, setScraperMessage] = useState<string | null>(null)
+  const [loadingData, setLoadingData] = useState(true)
   const [showInsights, setShowInsights] = useState(false)
+
+  const loadStats = useCallback(async () => {
+    try {
+      const res = await fetch('/api/stats', { cache: 'no-store' })
+      if (!res.ok) return
+      const data = await res.json()
+      setStats(prev => ({ ...prev, ...data }))
+    } catch (err) {
+      console.error('Failed to load stats', err)
+    }
+  }, [])
+
+  const loadJobs = useCallback(async () => {
+    try {
+      const params = new URLSearchParams({ limit: '100' })
+      if (filterRole) params.set('roleType', filterRole)
+      if (filterSource) params.set('source', filterSource.toLowerCase())
+      if (filterStatus) params.set('status', filterStatus)
+      const res = await fetch(`/api/jobs?${params}`, { cache: 'no-store' })
+      if (!res.ok) return
+      const data = await res.json()
+      setJobs(data.jobs || [])
+    } catch (err) {
+      console.error('Failed to load jobs', err)
+    }
+  }, [filterRole, filterSource, filterStatus])
+
+  useEffect(() => {
+    Promise.all([loadStats(), loadJobs()]).finally(() => setLoadingData(false))
+    const interval = setInterval(() => {
+      loadStats()
+      if (activeTab === 'jobs') loadJobs()
+    }, 30000)
+    return () => clearInterval(interval)
+  }, [loadStats, loadJobs, activeTab])
+
+  useEffect(() => { loadJobs() }, [loadJobs])
 
   const filteredJobs = jobs.filter(j => {
     const matchRole = !filterRole || j.roleType === filterRole
@@ -167,21 +169,61 @@ export default function Dashboard() {
     setAutoApply(prev => !prev)
   }
 
-  function handleManualApply(jobId: string) {
-    setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'QUEUED' } : j))
-    setTimeout(() => {
-      setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'APPLIED', appliedAt: new Date().toISOString() } : j))
-    }, 1800)
+  async function patchJob(jobId: string, patch: { status?: string; applyMode?: string }) {
+    const res = await fetch('/api/jobs', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: jobId, ...patch }),
+    })
+    if (!res.ok) throw new Error(`Update failed: ${res.status}`)
+    return res.json()
   }
 
-  function handleSkip(jobId: string) {
+  async function handleManualApply(jobId: string) {
+    setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'QUEUED' } : j))
+    try {
+      await patchJob(jobId, { status: 'QUEUED', applyMode: 'AUTO' })
+      loadJobs()
+    } catch (err) {
+      console.error(err)
+      loadJobs()
+    }
+  }
+
+  async function handleSkip(jobId: string) {
     setJobs(prev => prev.map(j => j.id === jobId ? { ...j, status: 'SKIPPED' } : j))
+    try {
+      await patchJob(jobId, { status: 'SKIPPED' })
+    } catch (err) {
+      console.error(err)
+      loadJobs()
+    }
   }
 
   async function triggerScraper() {
     setScraperRunning(true)
-    await new Promise(r => setTimeout(r, 3000))
-    setScraperRunning(false)
+    setScraperMessage(null)
+    try {
+      const res = await fetch('/api/scraper/trigger', { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setScraperMessage(data.error || `Trigger failed (${res.status})`)
+      } else {
+        setScraperMessage(`Scraper started — run ${data.runId?.slice(0, 8) || ''}. Jobs appear as they're scraped.`)
+        // Refresh stats every 10s for the next 2 minutes to pick up incoming jobs.
+        let ticks = 0
+        const poll = setInterval(() => {
+          loadStats()
+          loadJobs()
+          if (++ticks >= 12) clearInterval(poll)
+        }, 10000)
+      }
+    } catch (err: any) {
+      setScraperMessage(`Network error: ${err?.message || err}`)
+    } finally {
+      setScraperRunning(false)
+      setTimeout(() => setScraperMessage(null), 8000)
+    }
   }
 
   const tabs = [
@@ -207,7 +249,11 @@ export default function Dashboard() {
             <div className="flex items-center gap-1.5">
               <span className={`w-2 h-2 rounded-full ${scraperRunning ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} style={{ boxShadow: `0 0 0 3px ${scraperRunning ? '#fef3c7' : '#d1fae5'}` }} />
               <span className="text-xs text-ink-tertiary hidden sm:block">
-                {scraperRunning ? 'Scraping…' : `Last run: ${stats.lastScraperRun}`}
+                {scraperRunning
+                  ? 'Scraping…'
+                  : stats.lastScraperRun
+                    ? `Last run: ${new Date(stats.lastScraperRun).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}`
+                    : 'No runs yet'}
               </span>
             </div>
 
@@ -235,6 +281,13 @@ export default function Dashboard() {
 
       <main className="max-w-5xl mx-auto px-4 py-6">
 
+        {/* Scraper status banner */}
+        {scraperMessage && (
+          <div className="mb-5 bg-brand-50 border border-brand-200 rounded-2xl p-3 text-xs text-brand-800 animate-slide-down">
+            {scraperMessage}
+          </div>
+        )}
+
         {/* Manual mode banner */}
         {!autoApply && manualPendingJobs.length > 0 && (
           <div className="mb-5 bg-amber-50 border border-amber-200 rounded-2xl p-4 flex items-center gap-3 animate-slide-down">
@@ -248,11 +301,15 @@ export default function Dashboard() {
 
         {/* Stat cards */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">
-          <StatCard label="Jobs found" value={stats.totalFound.toLocaleString()} sub="+42 today" />
-          <StatCard label="Applied" value={stats.totalApplied.toLocaleString()} sub={`${Math.round(stats.totalApplied / stats.totalFound * 100)}% of found`} />
+          <StatCard label="Jobs found" value={stats.totalFound.toLocaleString()} sub={loadingData ? 'Loading…' : 'All time'} />
+          <StatCard
+            label="Applied"
+            value={stats.totalApplied.toLocaleString()}
+            sub={stats.totalFound > 0 ? `${Math.round((stats.totalApplied / stats.totalFound) * 100)}% of found` : '—'}
+          />
           <StatCard label="In review" value={stats.inReview} color="text-amber-500" />
           <StatCard label="Interviews" value={stats.interviews} color="text-emerald-500" sub={`${stats.successRate}% rate`} />
-          <StatCard label="Failed" value={stats.failed} color="text-red-400" sub="Need retry" />
+          <StatCard label="Failed" value={stats.failed} color="text-red-400" sub={stats.failed > 0 ? 'Need retry' : 'All clean'} />
         </div>
 
         {/* Tabs */}
