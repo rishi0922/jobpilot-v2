@@ -1,0 +1,10 @@
+{
+  "name": "JobPilot",
+  "short_name": "JobPilot",
+  "description": "Automated job scraping and application tracker for PM, APM, BA roles",
+  "start_url": "/dashboard",
+  "display": "standalone",
+  "background_color": "#fafafa",
+  "theme_color": "#4f46e5",
+  "icons": []
+}
