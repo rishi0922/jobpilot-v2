@@ -72,29 +72,47 @@ def verify_api_key(x_api_key: str = Header(...)):
     return x_api_key
 
 async def get_credentials(site: str) -> dict:
-    """Fetch decrypted credentials from Next.js API."""
-    async with httpx.AsyncClient() as client:
-        r = await client.put(
-            f"{NEXT_APP_URL}/api/credentials",
-            json={"siteName": site},
-            headers={"x-api-key": SCRAPER_API_KEY},
-            timeout=10,
-        )
-        if r.status_code == 200:
-            return r.json()
+    """Fetch decrypted credentials from Next.js API. Returns {} on any failure
+    so a missing/cold-started credential service doesn't kill the whole scrape."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.put(
+                f"{NEXT_APP_URL}/api/credentials",
+                json={"siteName": site},
+                headers={"x-api-key": SCRAPER_API_KEY},
+            )
+            if r.status_code == 200:
+                return r.json()
+            print(f"[creds] {site}: HTTP {r.status_code}")
+            return {}
+    except Exception as e:
+        print(f"[creds] {site}: {type(e).__name__}: {e}")
         return {}
 
 async def save_jobs(jobs: list[dict], run_id: str):
     """Post scraped jobs back to Next.js API."""
     if not jobs:
+        # Still notify so the run is marked complete even with 0 jobs
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                await client.post(
+                    f"{NEXT_APP_URL}/api/scraper/ingest",
+                    json={"jobs": [], "runId": run_id},
+                    headers={"x-api-key": SCRAPER_API_KEY},
+                )
+        except Exception as e:
+            print(f"[ingest] notify-empty failed: {type(e).__name__}: {e}")
         return
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            f"{NEXT_APP_URL}/api/scraper/ingest",
-            json={"jobs": jobs, "runId": run_id},
-            headers={"x-api-key": SCRAPER_API_KEY},
-            timeout=30,
-        )
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                f"{NEXT_APP_URL}/api/scraper/ingest",
+                json={"jobs": jobs, "runId": run_id},
+                headers={"x-api-key": SCRAPER_API_KEY},
+            )
+            print(f"[ingest] sent {len(jobs)} jobs → HTTP {r.status_code}")
+    except Exception as e:
+        print(f"[ingest] failed: {type(e).__name__}: {e}")
 
 @app.get("/health")
 def health():
@@ -106,55 +124,91 @@ class ScrapeRequest(BaseModel):
 
 
 async def _run_full_scrape(enabled: list[str], run_id: str):
-    """Background worker that runs every enabled scraper and posts results back."""
-    all_jobs:   list[dict] = []
-    seen_urls:  set[str]   = set()
+    """Background worker that runs every enabled scraper SEQUENTIALLY (one site
+    at a time) and posts results back. Sequential execution keeps memory under
+    the 512MB Render free-tier limit — each Playwright Chromium instance can
+    use 200-400MB on its own, so running 7 in parallel guarantees an OOM kill.
 
-    async def run_source(name: str, coro):
-        try:
-            jobs = await coro
-            unique = [j for j in jobs if j.get("sourceUrl") not in seen_urls]
-            for j in unique:
-                seen_urls.add(j["sourceUrl"])
-                j["roleType"] = classify_role(j.get("title", ""))
-                j["source"]   = name
-            return unique
-        except Exception as e:
-            print(f"[{name}] scrape error: {e}")
-            return []
+    We also flush jobs to the ingest endpoint after every site, so partial
+    progress is preserved even if a later scraper crashes the container.
+    """
+    seen_urls: set[str] = set()
+    total_saved = 0
 
-    tasks = []
-    if "naukri" in enabled:
+    # Map source name -> a zero-arg async callable that returns its job list.
+    # Wrapping in a callable lets us defer credential fetching and scraper
+    # invocation until that source's turn — important because credential
+    # fetches can also fail individually.
+    async def _naukri():
         creds = await get_credentials("Naukri")
-        tasks.append(run_source("naukri", scrape_naukri(SEARCH_QUERIES, creds)))
-    if "linkedin" in enabled:
+        return await scrape_naukri(SEARCH_QUERIES, creds)
+
+    async def _linkedin():
         creds = await get_credentials("LinkedIn")
-        tasks.append(run_source("linkedin", scrape_linkedin(SEARCH_QUERIES, creds)))
-    if "iimjobs" in enabled:
+        return await scrape_linkedin(SEARCH_QUERIES, creds)
+
+    async def _iimjobs():
         creds = await get_credentials("IIMJobs")
-        tasks.append(run_source("iimjobs", scrape_iimjobs(SEARCH_QUERIES, creds)))
-    if "instahyre" in enabled:
+        return await scrape_iimjobs(SEARCH_QUERIES, creds)
+
+    async def _instahyre():
         creds = await get_credentials("Instahyre")
-        tasks.append(run_source("instahyre", scrape_instahyre(SEARCH_QUERIES, creds)))
-    if "hirist" in enabled:
-        tasks.append(run_source("hirist", scrape_hirist(SEARCH_QUERIES, {})))
-    if "wellfound" in enabled:
-        tasks.append(run_source("wellfound", scrape_wellfound(SEARCH_QUERIES, {})))
-    if "mnc" in enabled:
-        tasks.append(run_source("mnc", scrape_mnc_sites()))
+        return await scrape_instahyre(SEARCH_QUERIES, creds)
 
-    try:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, list):
-                all_jobs.extend(r)
-            else:
-                print(f"[scrape] task error: {r}")
-    except Exception as e:
-        print(f"[scrape] gather failed: {e}")
+    async def _hirist():
+        return await scrape_hirist(SEARCH_QUERIES, {})
 
-    await save_jobs(all_jobs, run_id)
-    print(f"[scrape] {run_id} complete — {len(all_jobs)} jobs from {len(enabled)} sources")
+    async def _wellfound():
+        return await scrape_wellfound(SEARCH_QUERIES, {})
+
+    async def _mnc():
+        return await scrape_mnc_sites()
+
+    sources = {
+        "naukri":    _naukri,
+        "linkedin":  _linkedin,
+        "iimjobs":   _iimjobs,
+        "instahyre": _instahyre,
+        "hirist":    _hirist,
+        "wellfound": _wellfound,
+        "mnc":       _mnc,
+    }
+
+    for name in enabled:
+        runner = sources.get(name)
+        if not runner:
+            print(f"[scrape] unknown source: {name}")
+            continue
+
+        print(f"[scrape] starting {name}…")
+        try:
+            jobs = await runner()
+        except Exception as e:
+            print(f"[{name}] scrape error: {type(e).__name__}: {e}")
+            continue
+
+        unique = []
+        for j in jobs or []:
+            url = j.get("sourceUrl")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            j["roleType"] = classify_role(j.get("title", ""))
+            j["source"]   = name
+            unique.append(j)
+
+        print(f"[{name}] scraped {len(jobs or [])} jobs ({len(unique)} unique)")
+
+        # Flush after each source so partial progress survives container crashes
+        if unique:
+            await save_jobs(unique, run_id)
+            total_saved += len(unique)
+
+    # Final ping ensures the run is marked complete in the DB even if 0 jobs
+    if total_saved == 0:
+        await save_jobs([], run_id)
+
+    print(f"[scrape] {run_id} complete — {total_saved} jobs from {len(enabled)} sources")
 
 
 @app.post("/scrape", dependencies=[Depends(verify_api_key)], status_code=202)
