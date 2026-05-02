@@ -52,9 +52,13 @@ ROLE_MAP = {
     "ba ": "BUSINESS_ANALYST",
 }
 
-def classify_role(title: str) -> str:
-    t = title.lower()
-    if "associate product" in t or "apm" in t:
+def classify_role(title: str) -> Optional[str]:
+    """Map a job title to one of our role enums, or None if the title is
+    NOT one of the roles we target. Returning None lets the caller drop
+    irrelevant jobs (the whole reason for-the-search-keywords-matched-but-
+    title-was-actually-irrelevant problem)."""
+    t = f" {title.lower()} "
+    if "associate product manager" in t or " apm " in t:
         return "APM"
     if "program manager" in t:
         return "PROGRAM_MANAGER"
@@ -64,7 +68,22 @@ def classify_role(title: str) -> str:
         return "BUSINESS_ANALYST"
     if "product manager" in t or " pm " in t:
         return "PM"
-    return "PM"
+    if "product owner" in t or " po " in t:
+        return "PM"
+    return None  # title doesn't match any of our target roles → drop the job
+
+
+# Senior-level keywords we DON'T want for entry/mid roles
+SENIOR_KEYWORDS = (
+    "director", "vp", "vice president", "head of", "chief",
+    "principal", "staff", "lead ", " lead", "sr.", "sr ",
+    "senior", "snr", "group product", "gpm",
+)
+
+def is_relevant_job(title: str) -> bool:
+    """Drop jobs that match a role keyword but are clearly too senior."""
+    t = title.lower()
+    return not any(kw in t for kw in SENIOR_KEYWORDS)
 
 def verify_api_key(x_api_key: str = Header(...)):
     if x_api_key != SCRAPER_API_KEY:
@@ -188,16 +207,31 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
             continue
 
         unique = []
+        dropped_irrelevant = 0
+        dropped_senior     = 0
         for j in jobs or []:
             url = j.get("sourceUrl")
             if not url or url in seen_urls:
                 continue
             seen_urls.add(url)
-            j["roleType"] = classify_role(j.get("title", ""))
+
+            title = j.get("title", "")
+            role  = classify_role(title)
+            if role is None:
+                dropped_irrelevant += 1
+                continue
+            if not is_relevant_job(title):
+                dropped_senior += 1
+                continue
+
+            j["roleType"] = role
             j["source"]   = name
             unique.append(j)
 
-        print(f"[{name}] scraped {len(jobs or [])} jobs ({len(unique)} unique)")
+        print(
+            f"[{name}] scraped {len(jobs or [])} → kept {len(unique)} "
+            f"(dropped {dropped_irrelevant} irrelevant, {dropped_senior} too-senior)"
+        )
 
         # Flush after each source so partial progress survives container crashes
         if unique:
