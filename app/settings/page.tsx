@@ -36,7 +36,7 @@ export default function SettingsPage() {
   const [isUploading, setIsUploading] = useState<Record<string, boolean>>({})
 
   useEffect(() => {
-    fetch('/api/cvs')
+    fetch('/api/resumes')
       .then(res => res.json())
       .then(data => {
         if (data.cvs) {
@@ -111,7 +111,7 @@ export default function SettingsPage() {
     formData.append('roleType', role)
 
     try {
-      const res = await fetch('/api/cvs', {
+      const res = await fetch('/api/resumes', {
         method: 'POST',
         body: formData,
       })
