@@ -8,7 +8,8 @@ import {
 import {
   Search, RefreshCw, Settings, BrainCircuit, ChevronRight,
   Briefcase, Send, Clock, Trophy, AlertCircle, TrendingUp,
-  Zap, Eye, RotateCcw, Filter, ChevronDown
+  Zap, Eye, RotateCcw, Filter, ChevronDown, ThumbsUp, ThumbsDown,
+  X, ExternalLink, CheckCircle2, AlertTriangle, MapPin, Building2,
 } from 'lucide-react'
 
 const ROLE_LABELS: Record<string, string> = {
@@ -29,6 +30,15 @@ const STATUS_CONFIG: Record<string, { label: string; color: string; bg: string }
 
 const SOURCE_COLORS = ['#6366f1','#0ea5e9','#10b981','#f59e0b','#ef4444','#8b5cf6','#f97316']
 
+interface SourceHealth {
+  source: string
+  found: number
+  kept: number
+  dropped: number
+  skipped: number
+  ok: boolean
+}
+
 interface DashboardStats {
   totalFound: number
   totalApplied: number
@@ -42,6 +52,8 @@ interface DashboardStats {
   recentActivity: Array<{ date: string; applied: number; found: number }>
   lastScraperRun: string | null
   scraperStatus: 'idle' | 'running' | 'failed' | 'RUNNING' | 'COMPLETED' | 'FAILED'
+  sourceHealth: SourceHealth[]
+  lastRunAt: string | null
 }
 
 const EMPTY_STATS: DashboardStats = {
@@ -51,6 +63,8 @@ const EMPTY_STATS: DashboardStats = {
   recentActivity: [],
   lastScraperRun: null,
   scraperStatus: 'idle',
+  sourceHealth: [],
+  lastRunAt: null,
 }
 
 interface Job {
@@ -62,11 +76,28 @@ interface Job {
   roleType: string
   status: string
   matchScore: number | null
+  matchNotes?: string | null
+  feedback?: 'UP' | 'DOWN' | null
   appliedAt: string | null
   scrapedAt: string
   sourceUrl: string
   cvUsed: string | null
   applyMode: string
+}
+
+interface MatchReason {
+  weight: number
+  points: number
+  max: number
+  detail: string
+}
+
+interface JobDetail extends Job {
+  description: string | null
+  matchReasons: Record<string, MatchReason> | null
+  postedAt: string | null
+  salary: string | null
+  applications?: Array<{ id: string; status: string; submittedAt: string; errorLog: string | null; responseNote: string | null }>
 }
 
 // ---- Components ----
@@ -117,6 +148,11 @@ export default function Dashboard() {
   const [scraperMessage, setScraperMessage] = useState<string | null>(null)
   const [loadingData, setLoadingData] = useState(true)
   const [showInsights, setShowInsights] = useState(false)
+  const [detailJobId, setDetailJobId] = useState<string | null>(null)
+  const [detail, setDetail] = useState<JobDetail | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  // Sort state for the jobs list — defaults to highest match score first
+  const [sortBy, setSortBy] = useState<'matchScore' | 'scrapedAt'>('matchScore')
 
   const loadStats = useCallback(async () => {
     try {
@@ -155,13 +191,24 @@ export default function Dashboard() {
 
   useEffect(() => { loadJobs() }, [loadJobs])
 
-  const filteredJobs = jobs.filter(j => {
-    const matchRole = !filterRole || j.roleType === filterRole
-    const matchSource = !filterSource || j.source.toLowerCase() === filterSource.toLowerCase()
-    const matchStatus = !filterStatus || j.status === filterStatus
-    const matchSearch = !search || j.title.toLowerCase().includes(search.toLowerCase()) || j.company.toLowerCase().includes(search.toLowerCase())
-    return matchRole && matchSource && matchStatus && matchSearch
-  })
+  const filteredJobs = jobs
+    .filter(j => {
+      const matchRole = !filterRole || j.roleType === filterRole
+      const matchSource = !filterSource || j.source.toLowerCase() === filterSource.toLowerCase()
+      const matchStatus = !filterStatus || j.status === filterStatus
+      const matchSearch = !search || j.title.toLowerCase().includes(search.toLowerCase()) || j.company.toLowerCase().includes(search.toLowerCase())
+      return matchRole && matchSource && matchStatus && matchSearch
+    })
+    .sort((a, b) => {
+      if (sortBy === 'matchScore') {
+        // Highest score first; nulls sink to the bottom
+        const ascore = a.matchScore ?? -1
+        const bscore = b.matchScore ?? -1
+        if (bscore !== ascore) return bscore - ascore
+      }
+      // Tie-break / fallback: newest first
+      return new Date(b.scrapedAt).getTime() - new Date(a.scrapedAt).getTime()
+    })
 
   const manualPendingJobs = jobs.filter(j => j.status === 'FOUND' && !autoApply)
 
@@ -198,6 +245,45 @@ export default function Dashboard() {
       console.error(err)
       loadJobs()
     }
+  }
+
+  async function setFeedback(jobId: string, value: 'UP' | 'DOWN' | null) {
+    // Toggle: if user clicks the same button again, clear it.
+    const currentJob = jobs.find(j => j.id === jobId)
+    const next = currentJob?.feedback === value ? null : value
+    setJobs(prev => prev.map(j => j.id === jobId ? { ...j, feedback: next } : j))
+    try {
+      await fetch('/api/jobs/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: jobId, feedback: next }),
+      })
+    } catch (err) {
+      console.error('Feedback save failed', err)
+      loadJobs()  // revert
+    }
+  }
+
+  async function openDetail(jobId: string) {
+    setDetailJobId(jobId)
+    setDetail(null)
+    setDetailLoading(true)
+    try {
+      const res = await fetch(`/api/jobs/${jobId}`, { cache: 'no-store' })
+      if (!res.ok) throw new Error(`Status ${res.status}`)
+      const data: JobDetail = await res.json()
+      setDetail(data)
+    } catch (err) {
+      console.error('Failed to load job detail', err)
+      setDetail(null)
+    } finally {
+      setDetailLoading(false)
+    }
+  }
+
+  function closeDetail() {
+    setDetailJobId(null)
+    setDetail(null)
   }
 
   async function triggerScraper() {
@@ -373,6 +459,39 @@ export default function Dashboard() {
                 </ResponsiveContainer>
               </div>
             </div>
+
+            {/* Source health — last run breakdown */}
+            {stats.sourceHealth.length > 0 && (
+              <div className="bg-white rounded-2xl border border-surface-200 p-5">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <h2 className="text-sm font-semibold text-ink-primary">Source health (last run)</h2>
+                    <p className="text-xs text-ink-tertiary">
+                      {stats.lastRunAt
+                        ? `Run on ${new Date(stats.lastRunAt).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}`
+                        : 'Most recent scrape'}
+                    </p>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {stats.sourceHealth.map(s => (
+                    <div key={s.source} className="flex items-center justify-between bg-surface-50 border border-surface-200 rounded-xl px-3 py-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        {s.ok
+                          ? <CheckCircle2 size={13} className="text-emerald-500 shrink-0" />
+                          : <AlertTriangle size={13} className="text-amber-500 shrink-0" />}
+                        <span className="text-xs font-medium text-ink-primary truncate">{s.source}</span>
+                      </div>
+                      <div className="text-xs text-ink-tertiary whitespace-nowrap">
+                        <span className="text-emerald-600 font-medium">{s.kept}</span>
+                        <span className="text-ink-muted"> / {s.found} found</span>
+                        {s.dropped > 0 && <span className="text-amber-600"> · {s.dropped} dropped</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -402,26 +521,32 @@ export default function Dashboard() {
                 <option value="">All statuses</option>
                 {Object.entries(STATUS_CONFIG).map(([v, c]) => <option key={v} value={v}>{c.label}</option>)}
               </select>
+              <select value={sortBy} onChange={e => setSortBy(e.target.value as any)}
+                className="bg-white border border-surface-200 rounded-xl px-3 py-2 text-xs text-ink-secondary outline-none">
+                <option value="matchScore">Sort: Best match</option>
+                <option value="scrapedAt">Sort: Newest</option>
+              </select>
             </div>
 
             {/* Job cards */}
             <div className="space-y-2">
               {filteredJobs.map((job, i) => (
-                <div key={job.id} className="job-card bg-white border border-surface-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center gap-3"
+                <div key={job.id}
+                  className="job-card bg-white border border-surface-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center gap-3 hover:border-brand-300 transition-colors"
                   style={{ animationDelay: `${i * 30}ms` }}>
-                  {/* Info */}
-                  <div className="flex-1 min-w-0">
+                  {/* Info — clicking opens the detail modal */}
+                  <button type="button" onClick={() => openDetail(job.id)} className="flex-1 min-w-0 text-left">
                     <div className="flex items-start gap-2 flex-wrap">
-                      <p className="text-sm font-semibold text-ink-primary leading-tight">{job.title}</p>
+                      <p className="text-sm font-semibold text-ink-primary leading-tight hover:text-brand-700">{job.title}</p>
                       {job.status === 'FOUND' && !autoApply && (
                         <span className="badge" style={{ background: '#fef3c7', color: '#d97706' }}>Needs approval</span>
                       )}
                     </div>
                     <p className="text-xs text-ink-tertiary mt-1">
-                      {job.company} · {job.location} · <span className="text-brand-600">{job.source}</span>
+                      {job.company} · {job.location || '—'} · <span className="text-brand-600">{job.source}</span>
                       {job.appliedAt && <> · Applied {new Date(job.appliedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}</>}
                     </p>
-                  </div>
+                  </button>
 
                   {/* Right side */}
                   <div className="flex items-center gap-3 flex-wrap">
@@ -430,6 +555,28 @@ export default function Dashboard() {
                     </span>
                     <MatchScore score={job.matchScore} />
                     <StatusBadge status={job.status} />
+
+                    {/* 👍 / 👎 feedback */}
+                    <div className="flex items-center">
+                      <button onClick={() => setFeedback(job.id, 'UP')}
+                        title="Good fit"
+                        className={`p-1.5 rounded-lg transition-colors ${
+                          job.feedback === 'UP'
+                            ? 'text-emerald-600 bg-emerald-50'
+                            : 'text-ink-muted hover:text-emerald-600 hover:bg-emerald-50'
+                        }`}>
+                        <ThumbsUp size={13} />
+                      </button>
+                      <button onClick={() => setFeedback(job.id, 'DOWN')}
+                        title="Not a fit"
+                        className={`p-1.5 rounded-lg transition-colors ${
+                          job.feedback === 'DOWN'
+                            ? 'text-red-600 bg-red-50'
+                            : 'text-ink-muted hover:text-red-600 hover:bg-red-50'
+                        }`}>
+                        <ThumbsDown size={13} />
+                      </button>
+                    </div>
 
                     {/* Manual action buttons */}
                     {!autoApply && job.status === 'FOUND' && (
@@ -453,8 +600,9 @@ export default function Dashboard() {
                     )}
 
                     <a href={job.sourceUrl} target="_blank" rel="noopener noreferrer"
+                      title="Open original posting"
                       className="p-1.5 text-ink-muted hover:text-brand-600 hover:bg-brand-50 rounded-lg transition-colors">
-                      <ChevronRight size={14} />
+                      <ExternalLink size={14} />
                     </a>
                   </div>
                 </div>
@@ -592,6 +740,145 @@ export default function Dashboard() {
           </div>
         )}
       </main>
+
+      {/* ───── JOB DETAIL MODAL ───── */}
+      {detailJobId && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-sm p-2 sm:p-6 animate-fade-in"
+          onClick={closeDetail}>
+          <div className="bg-white rounded-2xl w-full max-w-3xl max-h-[90vh] overflow-y-auto shadow-2xl animate-slide-up"
+            onClick={e => e.stopPropagation()}>
+            {/* Header */}
+            <div className="sticky top-0 bg-white border-b border-surface-200 px-5 py-4 flex items-start justify-between gap-3 z-10">
+              <div className="flex-1 min-w-0">
+                <p className="text-base font-semibold text-ink-primary leading-tight">
+                  {detail?.title || (detailLoading ? 'Loading…' : 'Job details')}
+                </p>
+                {detail && (
+                  <p className="text-xs text-ink-tertiary mt-1 flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center gap-1"><Building2 size={11} />{detail.company}</span>
+                    {detail.location && <span className="inline-flex items-center gap-1"><MapPin size={11} />{detail.location}</span>}
+                    <span className="text-brand-600">{detail.source}</span>
+                    {detail.postedAt && <span className="text-ink-muted">Posted {new Date(detail.postedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}</span>}
+                  </p>
+                )}
+              </div>
+              <button onClick={closeDetail} className="p-1.5 text-ink-muted hover:text-ink-secondary hover:bg-surface-100 rounded-lg transition-colors shrink-0">
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Body */}
+            <div className="p-5 space-y-5">
+              {detailLoading && (
+                <div className="text-center py-12 text-ink-tertiary text-sm">Loading job details…</div>
+              )}
+
+              {!detailLoading && detail && (
+                <>
+                  {/* Match score breakdown */}
+                  <div className="bg-surface-50 border border-surface-200 rounded-xl p-4">
+                    <div className="flex items-start justify-between gap-3 mb-3">
+                      <div>
+                        <p className="text-xs text-ink-tertiary">Match score</p>
+                        <p className="text-3xl font-semibold" style={{
+                          color: (detail.matchScore ?? 0) >= 80 ? '#10b981'
+                               : (detail.matchScore ?? 0) >= 60 ? '#f59e0b'
+                               : '#ef4444'
+                        }}>
+                          {detail.matchScore ?? '—'}<span className="text-base text-ink-tertiary">/100</span>
+                        </p>
+                      </div>
+                      <StatusBadge status={detail.status} />
+                    </div>
+                    {detail.matchNotes && (
+                      <p className="text-xs text-ink-secondary mb-3">{detail.matchNotes}</p>
+                    )}
+                    {detail.matchReasons && (
+                      <div className="space-y-2">
+                        {Object.entries(detail.matchReasons).map(([factor, r]) => {
+                          const pct = r.max > 0 ? (r.points / r.max) * 100 : 0
+                          const fillColor = pct >= 80 ? '#10b981' : pct >= 50 ? '#f59e0b' : '#ef4444'
+                          return (
+                            <div key={factor}>
+                              <div className="flex items-center justify-between text-xs mb-1">
+                                <span className="text-ink-secondary capitalize">{factor}</span>
+                                <span className="text-ink-tertiary">{r.points}/{r.max}</span>
+                              </div>
+                              <div className="w-full h-1.5 bg-surface-200 rounded-full overflow-hidden mb-1">
+                                <div style={{ width: `${pct}%`, background: fillColor, height: '100%' }} />
+                              </div>
+                              <p className="text-xs text-ink-muted leading-snug">{r.detail}</p>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Description */}
+                  <div>
+                    <p className="text-xs font-semibold text-ink-primary mb-2">Job description</p>
+                    {detail.description ? (
+                      <div className="text-xs text-ink-secondary whitespace-pre-wrap leading-relaxed bg-white border border-surface-200 rounded-xl p-4 max-h-72 overflow-y-auto">
+                        {detail.description}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-ink-muted italic">No description was scraped for this job.</p>
+                    )}
+                  </div>
+
+                  {/* Apply history */}
+                  {detail.applications && detail.applications.length > 0 && (
+                    <div>
+                      <p className="text-xs font-semibold text-ink-primary mb-2">Apply history</p>
+                      <div className="space-y-1.5">
+                        {detail.applications.map(a => (
+                          <div key={a.id} className="text-xs bg-surface-50 border border-surface-200 rounded-lg px-3 py-2 flex items-center justify-between">
+                            <span className="text-ink-secondary">
+                              {new Date(a.submittedAt).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                            </span>
+                            <StatusBadge status={a.status} />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Actions */}
+                  <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-surface-200">
+                    <a href={detail.sourceUrl} target="_blank" rel="noopener noreferrer"
+                      className="flex items-center gap-1.5 text-xs font-medium px-3 py-2 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition-colors">
+                      <ExternalLink size={11} /> Open posting
+                    </a>
+                    {detail.status === 'FOUND' && (
+                      <button onClick={() => { handleManualApply(detail.id); closeDetail() }}
+                        className="flex items-center gap-1.5 text-xs font-medium px-3 py-2 border border-surface-200 text-ink-secondary rounded-xl hover:bg-surface-100 transition-colors">
+                        <Send size={11} /> Apply now
+                      </button>
+                    )}
+                    <button onClick={() => setFeedback(detail.id, 'UP')}
+                      className={`flex items-center gap-1.5 text-xs font-medium px-3 py-2 rounded-xl transition-colors ${
+                        detail.feedback === 'UP'
+                          ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                          : 'border border-surface-200 text-ink-secondary hover:bg-emerald-50 hover:text-emerald-700'
+                      }`}>
+                      <ThumbsUp size={11} /> Good fit
+                    </button>
+                    <button onClick={() => setFeedback(detail.id, 'DOWN')}
+                      className={`flex items-center gap-1.5 text-xs font-medium px-3 py-2 rounded-xl transition-colors ${
+                        detail.feedback === 'DOWN'
+                          ? 'bg-red-50 text-red-700 border border-red-200'
+                          : 'border border-surface-200 text-ink-secondary hover:bg-red-50 hover:text-red-700'
+                      }`}>
+                      <ThumbsDown size={11} /> Not a fit
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

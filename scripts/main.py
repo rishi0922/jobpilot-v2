@@ -20,6 +20,7 @@ from scrapers.instahyre import scrape_instahyre
 from scrapers.hirist import scrape_hirist
 from scrapers.wellfound import scrape_wellfound
 from scrapers.mnc import scrape_mnc_sites
+from scrapers.ats import scrape_ats
 from applicator import apply_to_job
 
 app = FastAPI(title="JobPilot Scraper", version="1.0.0")
@@ -183,7 +184,12 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
     async def _mnc():
         return await scrape_mnc_sites()
 
+    async def _ats():
+        # Pure HTTP/JSON — no Playwright, no creds. ~50 companies in ~30-60s.
+        return await scrape_ats()
+
     sources = {
+        "ats":       _ats,        # ← new: Greenhouse/Lever/Ashby (most reliable)
         "naukri":    _naukri,
         "linkedin":  _linkedin,
         "iimjobs":   _iimjobs,
@@ -225,7 +231,12 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
                 continue
 
             j["roleType"] = role
-            j["source"]   = name
+            # ATS scraper pre-tags each job with its specific vendor
+            # (ats:greenhouse / ats:lever / ats:ashby) so source-health stats
+            # show per-vendor breakdown. For all other scrapers, use the
+            # configured runner key.
+            if not j.get("source"):
+                j["source"] = name
             unique.append(j)
 
         print(
@@ -233,10 +244,17 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
             f"(dropped {dropped_irrelevant} irrelevant, {dropped_senior} too-senior)"
         )
 
-        # Flush after each source so partial progress survives container crashes
+        # Flush after each source so partial progress survives container crashes.
+        # ATS sub-sources mix multiple vendors in one batch; the ingest endpoint
+        # currently keys per-source-stats off the FIRST job's source tag. Group
+        # by tag and send each tag separately so per-vendor stats stay correct.
         if unique:
-            await save_jobs(unique, run_id)
-            total_saved += len(unique)
+            by_tag: dict[str, list[dict]] = {}
+            for j in unique:
+                by_tag.setdefault(j["source"], []).append(j)
+            for tag, batch in by_tag.items():
+                await save_jobs(batch, run_id)
+                total_saved += len(batch)
 
     # Final ping ensures the run is marked complete in the DB even if 0 jobs
     if total_saved == 0:

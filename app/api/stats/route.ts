@@ -52,6 +52,21 @@ export async function GET() {
         applied: r.jobsApplied,
       }))
 
+    // Pull source-health stats from the most recent run that actually
+    // recorded any. Older runs without sourceStats are skipped.
+    const latestWithStats = recentRuns.find(r => r.sourceStats && Object.keys(r.sourceStats as any).length > 0)
+    const sourceHealth = latestWithStats
+      ? Object.entries((latestWithStats.sourceStats as any) || {}).map(([source, s]: [string, any]) => ({
+          source,
+          found:   Number(s?.found   ?? 0),
+          kept:    Number(s?.kept    ?? 0),
+          dropped: Number(s?.dropped ?? 0),
+          skipped: Number(s?.skipped ?? 0),
+          // success = scraper returned at least one usable job after quality gate
+          ok: Number(s?.kept ?? 0) > 0,
+        }))
+      : []
+
     return NextResponse.json({
       totalFound, totalApplied, inReview, interviews, failed,
       successRate: totalApplied > 0 ? +((interviews / totalApplied) * 100).toFixed(1) : 0,
@@ -68,6 +83,8 @@ export async function GET() {
       recentActivity,
       lastScraperRun: recentRuns[0]?.completedAt ?? null,
       scraperStatus: recentRuns[0]?.status ?? 'idle',
+      sourceHealth,
+      lastRunAt: latestWithStats?.startedAt ?? null,
     })
   } catch (err) {
     console.error('GET /api/stats error:', err)
