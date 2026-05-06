@@ -1,9 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
+import { qualityGateReason, scoreJob, type ScoringProfile } from '@/lib/scoring'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
+
+async function loadScoringProfile(): Promise<ScoringProfile | null> {
+  const p = await prisma.profile.findUnique({ where: { id: 'default' } }).catch(() => null)
+  if (!p) return null
+  return {
+    yearsExperience:    p.yearsExperience,
+    skills:             p.skills || [],
+    preferredLocations: p.preferredLocations || [],
+    preferredIndustries: p.preferredIndustries || [],
+    remoteOnly:         !!p.remoteOnly,
+  }
+}
 
 export async function POST(req: NextRequest) {
   const apiKey = req.headers.get('x-api-key')
@@ -13,30 +26,85 @@ export async function POST(req: NextRequest) {
 
   try {
     const { jobs, runId } = await req.json()
-    if (!jobs?.length) return NextResponse.json({ saved: 0 })
+    if (!jobs?.length) {
+      // Empty payload still updates the run as completed (end-of-scrape signal)
+      if (runId) {
+        await prisma.scraperRun.updateMany({
+          where: { id: runId },
+          data: { status: 'COMPLETED', completedAt: new Date() },
+        })
+      }
+      return NextResponse.json({ saved: 0 })
+    }
 
-    const applyMode = process.env.DEFAULT_APPLY_MODE === 'MANUAL' ? 'MANUAL' : 'AUTO'
+    const applyMode    = process.env.DEFAULT_APPLY_MODE === 'MANUAL' ? 'MANUAL' : 'AUTO'
+    const minAutoScore = await getMinAutoApplyScore()
+    const profile      = await loadScoringProfile()
 
-    // Upsert jobs - skip if URL already exists
-    let saved = 0
-    let skipped = 0
+    let saved          = 0
+    let skipped        = 0
+    let droppedQuality = 0
+    const dropReasons: Record<string, number> = {}
 
     for (const job of jobs) {
+      // Pre-storage quality gate
+      const qReason = qualityGateReason({
+        title:       job.title,
+        company:     job.company,
+        description: job.description || null,
+        postedAt:    job.postedAt ? new Date(job.postedAt) : null,
+        sourceUrl:   job.sourceUrl,
+      })
+      if (qReason) {
+        droppedQuality++
+        dropReasons[qReason] = (dropReasons[qReason] || 0) + 1
+        continue
+      }
+
+      // Compute deterministic match score + breakdown
+      const { score, reasons, notes } = scoreJob(
+        {
+          title:       job.title,
+          company:     job.company,
+          location:    job.location || null,
+          description: job.description || null,
+          roleType:    job.roleType || 'PM',
+          source:      job.source,
+        },
+        profile
+      )
+
+      // AUTO-mode jobs only enter the apply queue if they meet the score
+      // threshold; lower-scored jobs go to FOUND so the user can review.
+      const initialStatus = applyMode === 'AUTO'
+        ? (score >= minAutoScore ? 'QUEUED' : 'FOUND')
+        : 'FOUND'
+
       try {
         await prisma.job.upsert({
           where:  { sourceUrl: job.sourceUrl },
-          update: { lastUpdated: new Date() }, // already exists - just touch it
+          update: {
+            lastUpdated:  new Date(),
+            // Refresh scoring on re-scrape (description may have updated, profile may have changed)
+            matchScore:   score,
+            matchNotes:   notes,
+            matchReasons: reasons as any,
+          },
           create: {
-            title:     job.title,
-            company:   job.company,
-            location:  job.location || null,
-            sourceUrl: job.sourceUrl,
-            source:    job.source,
-            roleType:  job.roleType || 'PM',
-            salary:    job.salary || null,
-            postedAt:  job.postedAt ? new Date(job.postedAt) : null,
-            status:    applyMode === 'AUTO' ? 'QUEUED' : 'FOUND',
-            applyMode: applyMode as any,
+            title:        job.title,
+            company:      job.company,
+            location:     job.location || null,
+            description:  job.description || null,
+            sourceUrl:    job.sourceUrl,
+            source:       job.source,
+            roleType:     job.roleType || 'PM',
+            salary:       job.salary || null,
+            postedAt:     job.postedAt ? new Date(job.postedAt) : null,
+            status:       initialStatus as any,
+            applyMode:    applyMode as any,
+            matchScore:   score,
+            matchNotes:   notes,
+            matchReasons: reasons as any,
           },
         })
         saved++
@@ -46,35 +114,75 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Update scraper run log — tag the specific run if we have its id, else
-    // touch all currently-RUNNING rows as a fallback.
-    if (runId) {
-      await prisma.scraperRun.updateMany({
-        where: { id: runId },
-        data: {
-          jobsFound: { increment: saved },
-          status: 'COMPLETED',
-          completedAt: new Date(),
-        },
+    // Roll up per-source stats so the dashboard can show source-health.
+    if (runId && jobs.length > 0) {
+      await mergeSourceStats(runId, jobs[0].source, {
+        found:     jobs.length,
+        kept:      saved,
+        skipped:   skipped,
+        dropped:   droppedQuality,
+        reasons:   dropReasons,
       })
-    } else {
+      await prisma.scraperRun.update({
+        where: { id: runId },
+        data: { jobsFound: { increment: saved } },
+      })
+    } else if (!runId) {
       await prisma.scraperRun.updateMany({
         where: { status: 'RUNNING' },
         data: { jobsFound: { increment: saved } },
       })
     }
 
-    // Trigger applicator for AUTO mode jobs
+    if (droppedQuality > 0) {
+      console.log(`[ingest] dropped ${droppedQuality} jobs by quality gate:`, dropReasons)
+    }
+
+    // Trigger applicator for AUTO mode jobs (only those that scored above threshold)
     if (applyMode === 'AUTO') {
-      // Fire and forget - the queue processor picks up QUEUED jobs
       void processQueue()
     }
 
-    return NextResponse.json({ saved, skipped, total: jobs.length })
-  } catch (err) {
+    return NextResponse.json({ saved, skipped, droppedQuality, total: jobs.length })
+  } catch (err: any) {
     console.error('Ingest error:', err)
-    return NextResponse.json({ error: 'Ingest failed' }, { status: 500 })
+    return NextResponse.json({ error: err?.message || 'Ingest failed' }, { status: 500 })
   }
+}
+
+async function getMinAutoApplyScore(): Promise<number> {
+  const p = await prisma.profile.findUnique({ where: { id: 'default' } }).catch(() => null)
+  return p?.minMatchScore ?? 60
+}
+
+async function mergeSourceStats(runId: string, source: string, stats: any) {
+  // Read-modify-write of the JSON column. ScraperRun has a sourceStats JSON
+  // map keyed by source name; we merge in this batch's numbers.
+  try {
+    const run = await prisma.scraperRun.findUnique({ where: { id: runId } })
+    if (!run) return
+    const cur = ((run.sourceStats as any) || {}) as Record<string, any>
+    const prev = cur[source] || { found: 0, kept: 0, skipped: 0, dropped: 0, reasons: {} }
+    cur[source] = {
+      found:   (prev.found   || 0) + (stats.found   || 0),
+      kept:    (prev.kept    || 0) + (stats.kept    || 0),
+      skipped: (prev.skipped || 0) + (stats.skipped || 0),
+      dropped: (prev.dropped || 0) + (stats.dropped || 0),
+      reasons: mergeReasons(prev.reasons || {}, stats.reasons || {}),
+    }
+    await prisma.scraperRun.update({
+      where: { id: runId },
+      data:  { sourceStats: cur as any },
+    })
+  } catch (e) {
+    console.error('mergeSourceStats failed:', e)
+  }
+}
+
+function mergeReasons(a: Record<string, number>, b: Record<string, number>): Record<string, number> {
+  const out = { ...a }
+  for (const [k, v] of Object.entries(b)) out[k] = (out[k] || 0) + (v || 0)
+  return out
 }
 
 async function processQueue() {

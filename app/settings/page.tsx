@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { Shield, Upload, Eye, EyeOff, CheckCircle, Plus, Trash2, ArrowLeft } from 'lucide-react'
+import { Shield, Upload, Eye, EyeOff, CheckCircle, Plus, Trash2, ArrowLeft, User, X, RefreshCw } from 'lucide-react'
 import Link from 'next/link'
 
 const SITES = [
@@ -23,8 +23,38 @@ const ROLE_TYPES = [
 
 interface CredState { username: string; password: string; saved: boolean; showPwd: boolean; saving?: boolean; error?: string }
 
+interface ProfileState {
+  fullName: string
+  email: string
+  phone: string
+  yearsExperience: string
+  currentRole: string
+  expectedSalaryLpa: string
+  noticePeriodDays: string
+  skills: string[]
+  preferredLocations: string[]
+  preferredIndustries: string[]
+  remoteOnly: boolean
+  minMatchScore: number
+}
+
+const EMPTY_PROFILE: ProfileState = {
+  fullName: '',
+  email: '',
+  phone: '',
+  yearsExperience: '',
+  currentRole: '',
+  expectedSalaryLpa: '',
+  noticePeriodDays: '',
+  skills: [],
+  preferredLocations: ['bengaluru', 'remote'],
+  preferredIndustries: [],
+  remoteOnly: false,
+  minMatchScore: 60,
+}
+
 export default function SettingsPage() {
-  const [activeSection, setActiveSection] = useState<'credentials' | 'cvs' | 'mnc' | 'preferences'>('credentials')
+  const [activeSection, setActiveSection] = useState<'profile' | 'credentials' | 'cvs' | 'mnc' | 'preferences'>('profile')
 
   const [creds, setCreds] = useState<Record<string, CredState>>(() =>
     Object.fromEntries(SITES.map(s => [s.name, { username: '', password: '', saved: false, showPwd: false }]))
@@ -34,6 +64,14 @@ export default function SettingsPage() {
     Object.fromEntries(ROLE_TYPES.map(r => [r.value, null]))
   )
   const [isUploading, setIsUploading] = useState<Record<string, boolean>>({})
+
+  // Profile state — drives the match-scoring engine on the server
+  const [profile, setProfile] = useState<ProfileState>(EMPTY_PROFILE)
+  const [profileSaving, setProfileSaving] = useState(false)
+  const [profileMessage, setProfileMessage] = useState<string | null>(null)
+  const [skillInput, setSkillInput] = useState('')
+  const [locationInput, setLocationInput] = useState('')
+  const [industryInput, setIndustryInput] = useState('')
 
   useEffect(() => {
     fetch('/api/resumes')
@@ -70,7 +108,81 @@ export default function SettingsPage() {
         }
       })
       .catch(err => console.error('Failed to load credentials', err))
+
+    // Load saved profile so the form reflects DB truth.
+    fetch('/api/profile')
+      .then(res => res.json())
+      .then(data => {
+        if (data?.id) {
+          setProfile({
+            fullName:            data.fullName ?? '',
+            email:               data.email ?? '',
+            phone:               data.phone ?? '',
+            yearsExperience:     data.yearsExperience != null ? String(data.yearsExperience) : '',
+            currentRole:         data.currentRole ?? '',
+            expectedSalaryLpa:   data.expectedSalaryLpa != null ? String(data.expectedSalaryLpa) : '',
+            noticePeriodDays:    data.noticePeriodDays != null ? String(data.noticePeriodDays) : '',
+            skills:              Array.isArray(data.skills) ? data.skills : [],
+            preferredLocations:  Array.isArray(data.preferredLocations) ? data.preferredLocations : [],
+            preferredIndustries: Array.isArray(data.preferredIndustries) ? data.preferredIndustries : [],
+            remoteOnly:          !!data.remoteOnly,
+            minMatchScore:       typeof data.minMatchScore === 'number' ? data.minMatchScore : 60,
+          })
+        }
+      })
+      .catch(err => console.error('Failed to load profile', err))
   }, [])
+
+  function addToList(field: 'skills' | 'preferredLocations' | 'preferredIndustries', value: string, clear: () => void) {
+    const v = value.trim().toLowerCase()
+    if (!v) return
+    setProfile(prev => prev[field].includes(v) ? prev : { ...prev, [field]: [...prev[field], v] })
+    clear()
+  }
+
+  function removeFromList(field: 'skills' | 'preferredLocations' | 'preferredIndustries', value: string) {
+    setProfile(prev => ({ ...prev, [field]: prev[field].filter(v => v !== value) }))
+  }
+
+  async function saveProfile(rescore: boolean) {
+    setProfileSaving(true)
+    setProfileMessage(null)
+    try {
+      const res = await fetch('/api/profile', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fullName:            profile.fullName || null,
+          email:               profile.email || null,
+          phone:               profile.phone || null,
+          yearsExperience:     profile.yearsExperience === '' ? null : Number(profile.yearsExperience),
+          currentRole:         profile.currentRole || null,
+          expectedSalaryLpa:   profile.expectedSalaryLpa === '' ? null : Number(profile.expectedSalaryLpa),
+          noticePeriodDays:    profile.noticePeriodDays === '' ? null : Number(profile.noticePeriodDays),
+          skills:              profile.skills,
+          preferredLocations:  profile.preferredLocations,
+          preferredIndustries: profile.preferredIndustries,
+          remoteOnly:          profile.remoteOnly,
+          minMatchScore:       profile.minMatchScore,
+        }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.error || `Save failed (${res.status})`)
+      }
+      setProfileMessage('Profile saved')
+      if (rescore) {
+        const r = await fetch('/api/jobs/rescore', { method: 'POST' })
+        const data = await r.json().catch(() => ({}))
+        setProfileMessage(r.ok ? `Profile saved · ${data.rescored ?? 0} jobs re-scored` : 'Saved, but rescoring failed')
+      }
+    } catch (err: any) {
+      setProfileMessage(err?.message || 'Save failed')
+    } finally {
+      setProfileSaving(false)
+      setTimeout(() => setProfileMessage(null), 6000)
+    }
+  }
 
   function updateCred(site: string, field: string, val: any) {
     setCreds(prev => ({ ...prev, [site]: { ...prev[site], [field]: val, saved: false, error: undefined } }))
@@ -132,6 +244,7 @@ export default function SettingsPage() {
   }
 
   const sections = [
+    { id: 'profile', label: 'Profile' },
     { id: 'credentials', label: 'Site credentials' },
     { id: 'cvs', label: 'CV files' },
     { id: 'mnc', label: 'MNC targets' },
@@ -160,6 +273,185 @@ export default function SettingsPage() {
             </button>
           ))}
         </div>
+
+        {/* ── PROFILE ── */}
+        {activeSection === 'profile' && (
+          <div className="space-y-4 animate-fade-in">
+            <div className="flex items-center gap-2 mb-2">
+              <User size={15} className="text-brand-600" />
+              <p className="text-xs text-ink-tertiary">
+                These details drive the match-score engine. The more accurate your profile, the better jobs are ranked.
+              </p>
+            </div>
+
+            {/* Basic info */}
+            <div className="bg-white border border-surface-200 rounded-2xl p-5">
+              <p className="text-sm font-semibold text-ink-primary mb-4">Basic info</p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-ink-tertiary block mb-1">Full name</label>
+                  <input value={profile.fullName} onChange={e => setProfile(p => ({ ...p, fullName: e.target.value }))}
+                    placeholder="Your name"
+                    className="w-full text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none focus:border-brand-400 text-ink-primary placeholder:text-ink-muted" />
+                </div>
+                <div>
+                  <label className="text-xs text-ink-tertiary block mb-1">Email</label>
+                  <input type="email" value={profile.email} onChange={e => setProfile(p => ({ ...p, email: e.target.value }))}
+                    placeholder="you@email.com"
+                    className="w-full text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none focus:border-brand-400 text-ink-primary placeholder:text-ink-muted" />
+                </div>
+                <div>
+                  <label className="text-xs text-ink-tertiary block mb-1">Phone</label>
+                  <input value={profile.phone} onChange={e => setProfile(p => ({ ...p, phone: e.target.value }))}
+                    placeholder="+91 xxxxx xxxxx"
+                    className="w-full text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none focus:border-brand-400 text-ink-primary placeholder:text-ink-muted" />
+                </div>
+                <div>
+                  <label className="text-xs text-ink-tertiary block mb-1">Current role</label>
+                  <input value={profile.currentRole} onChange={e => setProfile(p => ({ ...p, currentRole: e.target.value }))}
+                    placeholder="e.g. APM at Razorpay"
+                    className="w-full text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none focus:border-brand-400 text-ink-primary placeholder:text-ink-muted" />
+                </div>
+                <div>
+                  <label className="text-xs text-ink-tertiary block mb-1">Years of experience</label>
+                  <input type="number" min={0} max={50} value={profile.yearsExperience}
+                    onChange={e => setProfile(p => ({ ...p, yearsExperience: e.target.value }))}
+                    placeholder="0"
+                    className="w-full text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none focus:border-brand-400 text-ink-primary placeholder:text-ink-muted" />
+                </div>
+                <div>
+                  <label className="text-xs text-ink-tertiary block mb-1">Expected salary (LPA)</label>
+                  <input type="number" min={0} max={100} value={profile.expectedSalaryLpa}
+                    onChange={e => setProfile(p => ({ ...p, expectedSalaryLpa: e.target.value }))}
+                    placeholder="e.g. 18"
+                    className="w-full text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none focus:border-brand-400 text-ink-primary placeholder:text-ink-muted" />
+                </div>
+                <div>
+                  <label className="text-xs text-ink-tertiary block mb-1">Notice period (days)</label>
+                  <input type="number" min={0} max={365} value={profile.noticePeriodDays}
+                    onChange={e => setProfile(p => ({ ...p, noticePeriodDays: e.target.value }))}
+                    placeholder="e.g. 60"
+                    className="w-full text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none focus:border-brand-400 text-ink-primary placeholder:text-ink-muted" />
+                </div>
+              </div>
+            </div>
+
+            {/* Skills */}
+            <div className="bg-white border border-surface-200 rounded-2xl p-5">
+              <p className="text-sm font-semibold text-ink-primary mb-1">Skills</p>
+              <p className="text-xs text-ink-tertiary mb-3">Each skill is matched against job descriptions for scoring. Add 5-15 for best results.</p>
+              <div className="flex gap-2 mb-3">
+                <input value={skillInput} onChange={e => setSkillInput(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addToList('skills', skillInput, () => setSkillInput('')) } }}
+                  placeholder="e.g. sql, product analytics, figma"
+                  className="flex-1 text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none focus:border-brand-400 text-ink-primary placeholder:text-ink-muted" />
+                <button type="button" onClick={() => addToList('skills', skillInput, () => setSkillInput(''))}
+                  className="text-xs font-medium px-4 py-2 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition-colors">
+                  Add
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {profile.skills.length === 0 && <span className="text-xs text-ink-muted">No skills yet — add some above.</span>}
+                {profile.skills.map(s => (
+                  <span key={s} className="inline-flex items-center gap-1 text-xs bg-brand-50 text-brand-700 px-2 py-1 rounded-lg">
+                    {s}
+                    <button onClick={() => removeFromList('skills', s)} className="text-brand-500 hover:text-red-500">
+                      <X size={11} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {/* Preferred locations */}
+            <div className="bg-white border border-surface-200 rounded-2xl p-5">
+              <p className="text-sm font-semibold text-ink-primary mb-1">Preferred locations</p>
+              <p className="text-xs text-ink-tertiary mb-3">Cities you'd accept jobs in. "remote" matches any remote role.</p>
+              <div className="flex gap-2 mb-3">
+                <input value={locationInput} onChange={e => setLocationInput(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addToList('preferredLocations', locationInput, () => setLocationInput('')) } }}
+                  placeholder="e.g. bengaluru, mumbai, remote"
+                  className="flex-1 text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none focus:border-brand-400 text-ink-primary placeholder:text-ink-muted" />
+                <button type="button" onClick={() => addToList('preferredLocations', locationInput, () => setLocationInput(''))}
+                  className="text-xs font-medium px-4 py-2 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition-colors">
+                  Add
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-1.5 mb-3">
+                {profile.preferredLocations.length === 0 && <span className="text-xs text-ink-muted">No locations yet.</span>}
+                {profile.preferredLocations.map(l => (
+                  <span key={l} className="inline-flex items-center gap-1 text-xs bg-emerald-50 text-emerald-700 px-2 py-1 rounded-lg">
+                    {l}
+                    <button onClick={() => removeFromList('preferredLocations', l)} className="text-emerald-500 hover:text-red-500">
+                      <X size={11} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+              <label className="flex items-center gap-2 text-xs text-ink-secondary">
+                <input type="checkbox" checked={profile.remoteOnly}
+                  onChange={e => setProfile(p => ({ ...p, remoteOnly: e.target.checked }))}
+                  className="rounded" />
+                Remote-only — penalise India-only on-site jobs
+              </label>
+            </div>
+
+            {/* Industries */}
+            <div className="bg-white border border-surface-200 rounded-2xl p-5">
+              <p className="text-sm font-semibold text-ink-primary mb-1">Preferred industries</p>
+              <p className="text-xs text-ink-tertiary mb-3">Substring-matched against company name and description.</p>
+              <div className="flex gap-2 mb-3">
+                <input value={industryInput} onChange={e => setIndustryInput(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addToList('preferredIndustries', industryInput, () => setIndustryInput('')) } }}
+                  placeholder="e.g. fintech, ecommerce, saas, healthcare"
+                  className="flex-1 text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none focus:border-brand-400 text-ink-primary placeholder:text-ink-muted" />
+                <button type="button" onClick={() => addToList('preferredIndustries', industryInput, () => setIndustryInput(''))}
+                  className="text-xs font-medium px-4 py-2 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition-colors">
+                  Add
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {profile.preferredIndustries.length === 0 && <span className="text-xs text-ink-muted">No industries yet.</span>}
+                {profile.preferredIndustries.map(i => (
+                  <span key={i} className="inline-flex items-center gap-1 text-xs bg-amber-50 text-amber-700 px-2 py-1 rounded-lg">
+                    {i}
+                    <button onClick={() => removeFromList('preferredIndustries', i)} className="text-amber-500 hover:text-red-500">
+                      <X size={11} />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {/* Auto-apply threshold */}
+            <div className="bg-white border border-surface-200 rounded-2xl p-5">
+              <p className="text-sm font-semibold text-ink-primary mb-1">Minimum match score for auto-apply</p>
+              <p className="text-xs text-ink-tertiary mb-3">
+                In Auto Apply mode, only jobs scoring at or above this threshold get queued. Lower-scored jobs land in
+                "Found" for you to review manually.
+              </p>
+              <div className="flex items-center gap-3">
+                <input type="range" min={0} max={100} value={profile.minMatchScore}
+                  onChange={e => setProfile(p => ({ ...p, minMatchScore: Number(e.target.value) }))}
+                  className="flex-1" />
+                <span className="text-sm font-semibold text-brand-600 w-10 text-right">{profile.minMatchScore}</span>
+              </div>
+            </div>
+
+            {/* Save */}
+            <div className="flex flex-wrap items-center gap-3 pt-1">
+              <button onClick={() => saveProfile(false)} disabled={profileSaving}
+                className="text-xs font-medium px-4 py-2 bg-brand-600 text-white rounded-xl hover:bg-brand-700 transition-colors disabled:opacity-40">
+                {profileSaving ? 'Saving…' : 'Save profile'}
+              </button>
+              <button onClick={() => saveProfile(true)} disabled={profileSaving}
+                className="flex items-center gap-1.5 text-xs font-medium px-4 py-2 border border-surface-200 text-ink-secondary rounded-xl hover:bg-surface-100 transition-colors disabled:opacity-40">
+                <RefreshCw size={11} /> Save & re-score all jobs
+              </button>
+              {profileMessage && <span className="text-xs text-ink-tertiary">{profileMessage}</span>}
+            </div>
+          </div>
+        )}
 
         {/* ── CREDENTIALS ── */}
         {activeSection === 'credentials' && (

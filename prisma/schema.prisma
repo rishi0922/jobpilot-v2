@@ -13,7 +13,7 @@ model Job {
   company       String
   location      String?
   sourceUrl     String   @unique
-  source        String   // linkedin, naukri, iimjobs, instahyre, hirist, wellfound, mnc
+  source        String   // linkedin, naukri, iimjobs, instahyre, hirist, wellfound, mnc, ats:greenhouse, ats:lever, ats:ashby
   roleType      RoleType
   description   String?
   salary        String?
@@ -24,8 +24,10 @@ model Job {
   cvUsed        String?
   appliedAt     DateTime?
   lastUpdated   DateTime @updatedAt
-  matchScore    Int?     // 0-100 AI match score
-  matchNotes    String?  // AI analysis notes
+  matchScore    Int?     // 0-100 match score (deterministic)
+  matchNotes    String?  // human-readable match reasoning (multi-line)
+  matchReasons  Json?    // structured score breakdown { factor: { weight, points, max, detail } }
+  feedback      String?  // 'UP' | 'DOWN' | null — user's thumbs reaction
 
   applications  Application[]
 
@@ -33,6 +35,7 @@ model Job {
   @@index([status])
   @@index([source])
   @@index([scrapedAt])
+  @@index([matchScore])
 }
 
 model Application {
@@ -87,6 +90,26 @@ model ScraperRun {
   sources      String[] // which sources were scraped
   errorsJson   Json?
   status       RunStatus @default(RUNNING)
+  sourceStats  Json?    // { source: { found, kept, droppedIrrelevant, droppedSenior, error? } }
+}
+
+// User profile — singleton row (id is fixed). Used to score job-fit.
+model Profile {
+  id                String   @id @default("default")
+  fullName          String?
+  email             String?
+  phone             String?
+  yearsExperience   Int?     // total years of relevant experience
+  currentRole       String?
+  expectedSalaryLpa Int?     // expected salary in lakhs per annum (LPA, India context)
+  noticePeriodDays  Int?
+  skills            String[] // e.g. ["sql", "product analytics", "figma", "agile"]
+  preferredLocations String[] // e.g. ["bengaluru", "remote", "hybrid"]
+  preferredIndustries String[] // e.g. ["fintech", "ecommerce", "saas"]
+  remoteOnly        Boolean  @default(false)
+  minMatchScore     Int      @default(60) // auto-apply only above this score
+  updatedAt         DateTime @updatedAt
+  createdAt         DateTime @default(now())
 }
 
 model CvAnalysis {
