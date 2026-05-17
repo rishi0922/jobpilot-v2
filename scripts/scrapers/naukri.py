@@ -141,9 +141,31 @@ async def scrape_naukri(queries: list[str], credentials: dict) -> list[dict]:
                         jobs.append(row)
                         added_from_dom += 1
 
-                added_this_page = added_from_api + added_from_dom
+                # ── Path C: inline-JSON fallback ─────────────────────────
+                # If neither the in-page API nor the DOM cards yielded
+                # anything, scan the page's <script> tags for an embedded
+                # JSON blob with jobDetails. Naukri's SSR sometimes hydrates
+                # results into a window-level variable that's there even
+                # when the visible DOM hasn't drawn yet.
+                added_from_inline = 0
+                if added_from_api == 0 and added_from_dom == 0:
+                    inline_rows = await _fetch_inline_json(page)
+                    for row in inline_rows:
+                        src = row.get("sourceUrl")
+                        if not src or src in seen:
+                            continue
+                        seen.add(src)
+                        jobs.append(row)
+                        added_from_inline += 1
+
+                added_this_page = added_from_api + added_from_dom + added_from_inline
                 kept_for_query += added_this_page
-                tag = "api" if added_from_api else "dom"
+                tag = (
+                    "api"    if added_from_api    else
+                    "dom"    if added_from_dom    else
+                    "inline" if added_from_inline else
+                    "empty"
+                )
                 print(
                     f"[naukri] '{query}' page={page_idx+1} offset={offset} "
                     f"+{added_this_page} ({tag})"
@@ -175,7 +197,9 @@ def _seo_url(query: str, offset: int) -> str:
 
 async def _fetch_via_page(page, query: str, page_no: int) -> list[dict]:
     """Call Naukri's JSON search API from inside the rendered page, so
-    cookies + bot-check tokens are attached automatically. Returns [] on any
+    cookies + bot-check tokens are attached automatically. Tries /v3 first,
+    then /v4 — Naukri has historically published both side-by-side and
+    rotates which one is the recaptcha-gated mirror. Returns [] on any
     failure — caller falls back to rendered-DOM scraping."""
     params = {
         "noOfResults": HTML_RESULTS_PER_PAGE,
@@ -191,22 +215,33 @@ async def _fetch_via_page(page, query: str, page_no: int) -> list[dict]:
     qs = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
     js = """
     async ({qs}) => {
-      try {
-        const r = await fetch('/jobapi/v3/search?' + qs, {
-          headers: {
-            'appid': '109',
-            'systemid': 'Naukri',
-            'clientid': 'd3skt0p',
-            'Accept': 'application/json',
-          },
-          credentials: 'include',
-        });
-        if (!r.ok) return { error: 'HTTP ' + r.status };
-        const json = await r.json();
-        return { json };
-      } catch (e) {
-        return { error: String(e) };
+      // Try v3 then v4. The header set Naukri's JS client uses has rotated
+      // a couple of times — we send a superset that has worked in all the
+      // versions seen in the last 18 months.
+      const HEADERS = {
+        'appid': '109',
+        'systemid': 'Naukri',
+        'clientid': 'd3skt0p',
+        'Accept': 'application/json',
+        'gid': 'LOCATION,INDUSTRY,EDUCATION,FAREA_ROLE',
+      };
+      for (const ver of ['v3', 'v4']) {
+        try {
+          const r = await fetch('/jobapi/' + ver + '/search?' + qs, {
+            headers: HEADERS,
+            credentials: 'include',
+          });
+          if (r.ok) {
+            const json = await r.json();
+            return { json, ver };
+          }
+          // 4xx/5xx — try the next version.
+          if (ver === 'v4') return { error: 'HTTP ' + r.status };
+        } catch (e) {
+          if (ver === 'v4') return { error: String(e) };
+        }
       }
+      return { error: 'no version responded' };
     }
     """
     try:
@@ -279,6 +314,86 @@ def _ms_epoch_to_iso(ms: object) -> Optional[str]:
         return datetime.utcfromtimestamp(int(ms) / 1000).isoformat()
     except Exception:
         return None
+
+
+# ── Path C: inline-script JSON scrape ───────────────────────────────────────
+
+async def _fetch_inline_json(page) -> list[dict]:
+    """Look for an embedded JSON blob in the page that contains the job
+    listings. Naukri's SSR puts them into a window-level state object;
+    the exact variable name has rotated, so we scan all <script> tags
+    rather than hard-code a key. Returns at most HTML_RESULTS_PER_PAGE rows.
+
+    This is a fragile path but better than returning 0 when both the
+    in-browser API and the DOM cards have failed."""
+    js = r"""
+    () => {
+      const scripts = Array.from(document.querySelectorAll('script'));
+      for (const s of scripts) {
+        const txt = s.textContent || '';
+        if (!txt.includes('jobDetails') && !txt.includes('jobsList')) continue;
+        // Try to surface any JSON-looking substring that has a jobDetails or
+        // jobsList array. Search for the first '{' through the matching
+        // closing '}' — naive but works because Naukri's blob is one object.
+        const startKeys = ['jobDetails', 'jobsList'];
+        for (const key of startKeys) {
+          const i = txt.indexOf('"' + key + '"');
+          if (i < 0) continue;
+          // Walk back to the nearest opening '{' that's the parent object.
+          let braceStart = txt.lastIndexOf('{', i);
+          let depth = 0;
+          let end = -1;
+          for (let j = braceStart; j < txt.length; j++) {
+            const ch = txt[j];
+            if (ch === '{') depth++;
+            else if (ch === '}') {
+              depth--;
+              if (depth === 0) { end = j; break; }
+            }
+          }
+          if (end < 0) continue;
+          try {
+            const blob = JSON.parse(txt.slice(braceStart, end + 1));
+            const list = blob.jobDetails || blob.jobsList || [];
+            if (Array.isArray(list) && list.length > 0) return list;
+          } catch (e) { /* keep trying */ }
+        }
+      }
+      return [];
+    }
+    """
+    try:
+        items = await page.evaluate(js)
+    except Exception as e:
+        print(f"[naukri] inline JSON eval error: {type(e).__name__}: {e}")
+        return []
+
+    out: list[dict] = []
+    if not isinstance(items, list):
+        return out
+    for j in items[:HTML_RESULTS_PER_PAGE]:
+        if not isinstance(j, dict):
+            continue
+        title = (j.get("title") or j.get("jobTitle") or "").strip()
+        if not title:
+            continue
+        company = (j.get("companyName") or j.get("company") or "").strip()
+        href = j.get("jdURL") or j.get("staticUrl") or j.get("jobUrl") or ""
+        if not href:
+            continue
+        href = href if href.startswith("http") else f"{BASE_URL}{href}"
+        href = href.split("?")[0]
+        out.append({
+            "title":       title,
+            "company":     company,
+            "location":    (j.get("placeholders", [{}])[0].get("label", "") if j.get("placeholders") else "") or "India",
+            "salary":      None,
+            "sourceUrl":   href,
+            "description": (j.get("jobDescription") or "").strip()[:4000] or None,
+            "postedAt":    _ms_epoch_to_iso(j.get("createdDate")),
+            "scrapedAt":   datetime.utcnow().isoformat(),
+        })
+    return out
 
 
 # ── Path B: rendered-DOM card scrape ────────────────────────────────────────

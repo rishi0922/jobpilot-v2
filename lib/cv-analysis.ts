@@ -20,19 +20,12 @@ export interface PostApplicationInsight {
   keywordsThatWork: string[]
 }
 
-export async function analyzeCV(
-  cvText: string,
-  jobDescription: string,
-  roleType: string
-): Promise<CVAnalysisResult> {
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 1000,
-    messages: [{
-      role: 'user',
-      content: `You are an expert recruiter and career coach specialising in Indian IT product and PM roles.
+/** Build the analysis prompt — same regardless of whether the CV is supplied
+ *  as inline text or as a PDF document block. */
+function buildCvAnalysisPrompt(jobDescription: string, roleType: string, cvText?: string) {
+  return `You are an expert recruiter and career coach specialising in Indian IT product and PM roles.
 
-Analyse this CV against this job description and respond ONLY with valid JSON matching this schema exactly:
+Analyse the candidate's CV (provided ${cvText ? 'below as plain text' : 'as the attached PDF document'}) against this job description and respond ONLY with valid JSON matching this schema exactly:
 {
   "matchScore": <0-100 integer>,
   "strengths": [<3-5 strings: what aligns well>],
@@ -45,29 +38,81 @@ Analyse this CV against this job description and respond ONLY with valid JSON ma
 
 ROLE TYPE: ${roleType}
 
-CV CONTENT:
-${cvText}
-
+${cvText ? `CV CONTENT:\n${cvText}\n` : ''}
 JOB DESCRIPTION:
 ${jobDescription}
 
 Respond with JSON only. No markdown, no explanation.`
-    }]
-  })
+}
 
-  const text = response.content[0].type === 'text' ? response.content[0].text : '{}'
+/** Parse the Claude JSON response, with a graceful fallback if it didn't
+ *  return valid JSON (rare, but possible if max_tokens truncates). */
+function parseAnalysisResponse(text: string): CVAnalysisResult {
   try {
     return JSON.parse(text.replace(/```json|```/g, '').trim())
   } catch {
     return {
       matchScore: 0,
       strengths: [],
-      gaps: ['Analysis failed — check CV format'],
-      suggestions: ['Re-upload CV as clean PDF text'],
+      gaps: ['Analysis failed — could not parse Claude response'],
+      suggestions: ['Try again with a shorter CV/JD, or paste CV text directly'],
       keywords: [],
       summary: 'Could not parse analysis.',
     }
   }
+}
+
+/** Analyse a CV against a JD using inline CV text. Use this when the caller
+ *  already has parsed CV text (e.g. user pasted it in). */
+export async function analyzeCV(
+  cvText: string,
+  jobDescription: string,
+  roleType: string
+): Promise<CVAnalysisResult> {
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1000,
+    messages: [{
+      role: 'user',
+      content: buildCvAnalysisPrompt(jobDescription, roleType, cvText),
+    }]
+  })
+  const text = response.content[0].type === 'text' ? response.content[0].text : '{}'
+  return parseAnalysisResponse(text)
+}
+
+/** Same analysis, but with the CV supplied as a base64-encoded PDF. Claude
+ *  reads PDF documents natively (text + layout), so this avoids needing a
+ *  Node-side PDF parser like pdf-parse. The base64 string must NOT include
+ *  the `data:application/pdf;base64,` prefix — strip it first. */
+export async function analyzeCVFromPdfBase64(
+  cvPdfBase64: string,
+  jobDescription: string,
+  roleType: string
+): Promise<CVAnalysisResult> {
+  const response = await client.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1000,
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'document',
+          source: {
+            type: 'base64',
+            media_type: 'application/pdf',
+            data: cvPdfBase64,
+          },
+        } as any,
+        {
+          type: 'text',
+          text: buildCvAnalysisPrompt(jobDescription, roleType),
+        },
+      ] as any,
+    }]
+  })
+  const text = response.content[0].type === 'text' ? response.content[0].text : '{}'
+  return parseAnalysisResponse(text)
 }
 
 export async function generatePostApplicationInsights(

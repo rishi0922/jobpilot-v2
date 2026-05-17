@@ -143,11 +143,39 @@ function MatchScore({ score }: { score: number | null }) {
   )
 }
 
+// ── CV Analysis types ──
+interface CvOption {
+  id: string
+  roleType: string
+  fileName: string
+  version: number
+}
+
+interface CvAnalysisResult {
+  matchScore: number
+  strengths: string[]
+  gaps: string[]
+  suggestions: string[]
+  keywords: string[]
+  summary: string
+  recommendedCvRole?: string
+}
+
+interface PostApplicationInsight {
+  successPatterns: string[]
+  failPatterns: string[]
+  topPerformingRoles: string[]
+  cvImprovements: string[]
+  keywordsThatWork: string[]
+  applied?: number
+}
+
 export default function Dashboard() {
   const [stats, setStats] = useState<DashboardStats>(EMPTY_STATS)
   const [jobs, setJobs] = useState<Job[]>([])
   const [autoApply, setAutoApply] = useState(true)
-  const [activeTab, setActiveTab] = useState<'overview' | 'jobs' | 'analysis'>('overview')
+  // 'mnc' is a synthetic tab — same UI as 'jobs' but pre-filtered to source='mnc'.
+  const [activeTab, setActiveTab] = useState<'overview' | 'jobs' | 'mnc' | 'analysis'>('overview')
   const [filterRole, setFilterRole] = useState('')
   const [filterSource, setFilterSource] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
@@ -177,6 +205,23 @@ export default function Dashboard() {
   const JOBS_PER_PAGE = 50
   // True while a bulk-retry of all FAILED jobs is in flight.
   const [retryingAll, setRetryingAll] = useState(false)
+
+  // ── CV Analysis state ──
+  // Available CVs loaded from /api/resumes. Empty until the analysis tab is
+  // opened for the first time.
+  const [cvOptions, setCvOptions]           = useState<CvOption[]>([])
+  const [cvLoadError, setCvLoadError]       = useState<string | null>(null)
+  // Selected CV id and the pasted JD content.
+  const [selectedCvId, setSelectedCvId]     = useState<string>('')
+  const [analysisJd, setAnalysisJd]         = useState('')
+  // Result + loading/error states for the pre-application analysis call.
+  const [analyzing, setAnalyzing]           = useState(false)
+  const [analysisResult, setAnalysisResult] = useState<CvAnalysisResult | null>(null)
+  const [analysisError, setAnalysisError]   = useState<string | null>(null)
+  // Post-application insights — generated on-demand from past Applied/Rejected/etc rows.
+  const [insightsLoading, setInsightsLoading] = useState(false)
+  const [insights, setInsights]               = useState<PostApplicationInsight | null>(null)
+  const [insightsError, setInsightsError]     = useState<string | null>(null)
 
   const loadStats = useCallback(async () => {
     try {
@@ -255,13 +300,22 @@ export default function Dashboard() {
       return new Date(b.scrapedAt).getTime() - new Date(a.scrapedAt).getTime()
     })
 
+  // When the user is on the MNC tab, further narrow the list to MNC sources
+  // before pagination. Keeps all other UI logic (search, role/status filters,
+  // pagination, retry) identical to the All-Jobs view.
+  const tabFilteredJobs = activeTab === 'mnc'
+    ? filteredJobs.filter(j => j.source === 'mnc')
+    : filteredJobs
+
   // 50-per-page slice of the filtered/sorted list. `totalPages` is at least 1
   // so the pagination bar still renders sensibly on an empty list.
-  const totalPages    = Math.max(1, Math.ceil(filteredJobs.length / JOBS_PER_PAGE))
+  const totalPages    = Math.max(1, Math.ceil(tabFilteredJobs.length / JOBS_PER_PAGE))
   const safePage      = Math.min(currentPage, totalPages)
   const pageStart     = (safePage - 1) * JOBS_PER_PAGE
   const pageEnd       = pageStart + JOBS_PER_PAGE
-  const paginatedJobs = filteredJobs.slice(pageStart, pageEnd)
+  const paginatedJobs = tabFilteredJobs.slice(pageStart, pageEnd)
+  // Stats for the tab badge — how many MNC jobs are currently loaded.
+  const mncCount      = jobs.filter(j => j.source === 'mnc').length
 
   const manualPendingJobs = jobs.filter(j => j.status === 'FOUND' && !autoApply)
   // FAILED jobs visible in the *currently loaded* set — bulk retry only acts
@@ -367,6 +421,96 @@ export default function Dashboard() {
     setDetail(null)
   }
 
+  /** Load the list of uploaded CVs once when the user opens the Analysis tab.
+   *  Auto-selects the first CV so the user can start analyzing without an
+   *  extra click. */
+  const loadCvOptions = useCallback(async () => {
+    setCvLoadError(null)
+    try {
+      const res = await fetch('/api/resumes', { cache: 'no-store' })
+      if (!res.ok) {
+        setCvLoadError(`Could not load CVs (HTTP ${res.status})`)
+        return
+      }
+      const data = await res.json()
+      const list: CvOption[] = data.cvs || []
+      setCvOptions(list)
+      if (list.length > 0 && !selectedCvId) {
+        setSelectedCvId(list[0].id)
+      }
+    } catch (err: any) {
+      setCvLoadError(err?.message || 'Failed to load CVs')
+    }
+  }, [selectedCvId])
+
+  useEffect(() => {
+    if (activeTab === 'analysis' && cvOptions.length === 0 && !cvLoadError) {
+      loadCvOptions()
+    }
+  }, [activeTab, cvOptions.length, cvLoadError, loadCvOptions])
+
+  /** Pre-application analysis. Sends the selected CV id + pasted JD to
+   *  the backend, which calls Claude with the PDF attached. */
+  async function runCvAnalysis() {
+    setAnalysisError(null)
+    setAnalysisResult(null)
+    if (!analysisJd.trim()) {
+      setAnalysisError('Paste a job description first.')
+      return
+    }
+    if (!selectedCvId) {
+      setAnalysisError('Upload at least one CV in Settings, then refresh.')
+      return
+    }
+    const cv = cvOptions.find(c => c.id === selectedCvId)
+    setAnalyzing(true)
+    try {
+      const res = await fetch('/api/resumes/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type:           'pre_application',
+          cvId:           selectedCvId,
+          jobDescription: analysisJd,
+          roleType:       cv?.roleType || 'PM',
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setAnalysisError(data.error || `Analysis failed (HTTP ${res.status})`)
+      } else {
+        setAnalysisResult(data)
+      }
+    } catch (err: any) {
+      setAnalysisError(err?.message || 'Network error')
+    } finally {
+      setAnalyzing(false)
+    }
+  }
+
+  /** Post-application insights — patterns across applied jobs. */
+  async function refreshInsights() {
+    setInsightsError(null)
+    setInsightsLoading(true)
+    try {
+      const res = await fetch('/api/resumes/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'post_application' }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setInsightsError(data.error || `Insights failed (HTTP ${res.status})`)
+      } else {
+        setInsights(data)
+      }
+    } catch (err: any) {
+      setInsightsError(err?.message || 'Network error')
+    } finally {
+      setInsightsLoading(false)
+    }
+  }
+
   async function triggerScraper() {
     setScraperRunning(true)
     setScraperMessage(null)
@@ -395,7 +539,8 @@ export default function Dashboard() {
 
   const tabs = [
     { id: 'overview', label: 'Overview' },
-    { id: 'jobs', label: `Jobs (${filteredJobs.length})` },
+    { id: 'jobs',     label: `All Jobs (${filteredJobs.length})` },
+    { id: 'mnc',      label: `MNC Jobs (${mncCount})` },
     { id: 'analysis', label: 'CV Analysis' },
   ]
 
@@ -585,9 +730,18 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* ===== JOBS TAB ===== */}
-        {activeTab === 'jobs' && (
+        {/* ===== JOBS TAB (also reused for MNC tab — same UI, narrower source) ===== */}
+        {(activeTab === 'jobs' || activeTab === 'mnc') && (
           <div className="animate-fade-in">
+            {activeTab === 'mnc' && (
+              <div className="mb-3 bg-brand-50 border border-brand-100 rounded-2xl px-4 py-2 text-xs text-brand-800 flex items-center gap-2">
+                <Building2 size={13} />
+                <span>
+                  Showing only jobs scraped directly from MNC career sites.
+                  {mncCount === 0 && ' No MNC jobs in the current load — run the scraper, then check back.'}
+                </span>
+              </div>
+            )}
             {/* Filters row */}
             <div className="flex flex-wrap gap-2 mb-4">
               <div className="flex items-center gap-1.5 bg-white border border-surface-200 rounded-xl px-3 py-2 flex-1 min-w-[160px]">
@@ -601,11 +755,13 @@ export default function Dashboard() {
                 <option value="">All roles</option>
                 {Object.entries(ROLE_LABELS).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
               </select>
-              <select value={filterSource} onChange={e => setFilterSource(e.target.value)}
-                className="bg-white border border-surface-200 rounded-xl px-3 py-2 text-xs text-ink-secondary outline-none">
-                <option value="">All sources</option>
-                {stats.bySource.map(s => <option key={s.source} value={s.source}>{s.source}</option>)}
-              </select>
+              {activeTab !== 'mnc' && (
+                <select value={filterSource} onChange={e => setFilterSource(e.target.value)}
+                  className="bg-white border border-surface-200 rounded-xl px-3 py-2 text-xs text-ink-secondary outline-none">
+                  <option value="">All sources</option>
+                  {stats.bySource.map(s => <option key={s.source} value={s.source}>{s.source}</option>)}
+                </select>
+              )}
               <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}
                 className="bg-white border border-surface-200 rounded-xl px-3 py-2 text-xs text-ink-secondary outline-none">
                 <option value="">All statuses</option>
@@ -737,10 +893,12 @@ export default function Dashboard() {
                 </div>
               ))}
 
-              {filteredJobs.length === 0 && (
+              {tabFilteredJobs.length === 0 && (
                 <div className="text-center py-16 text-ink-tertiary">
                   <Briefcase size={32} className="mx-auto mb-3 opacity-30" />
-                  <p className="text-sm">No jobs match your filters</p>
+                  <p className="text-sm">
+                    {activeTab === 'mnc' ? 'No MNC jobs match your filters' : 'No jobs match your filters'}
+                  </p>
                 </div>
               )}
 
@@ -749,14 +907,14 @@ export default function Dashboard() {
                     against the filtered list, plus a Load-more link if the
                     server has rows we haven't fetched yet.
                   - Right: Previous / Page N of M / Next page controls. */}
-              {filteredJobs.length > 0 && (
+              {tabFilteredJobs.length > 0 && (
                 <div className="pt-4 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-ink-tertiary">
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
                     <span>
                       Showing{' '}
-                      <span className="text-ink-secondary font-medium">{pageStart + 1}–{Math.min(pageEnd, filteredJobs.length)}</span>
-                      {' '}of <span className="text-ink-secondary font-medium">{filteredJobs.length}</span>
-                      {filteredJobs.length !== jobs.length && (
+                      <span className="text-ink-secondary font-medium">{pageStart + 1}–{Math.min(pageEnd, tabFilteredJobs.length)}</span>
+                      {' '}of <span className="text-ink-secondary font-medium">{tabFilteredJobs.length}</span>
+                      {tabFilteredJobs.length !== jobs.length && (
                         <> filtered (<span className="text-ink-secondary font-medium">{jobs.length}</span> loaded)</>
                       )}
                       {' · '}<span className="text-ink-muted">{jobsTotal} total on server</span>
@@ -808,58 +966,131 @@ export default function Dashboard() {
                 </div>
                 <div>
                   <h2 className="text-sm font-semibold text-ink-primary">Pre-application CV scorer</h2>
-                  <p className="text-xs text-ink-tertiary">AI scores your CV against a job description before applying</p>
-                </div>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="text-xs text-ink-tertiary block mb-1.5">Paste job description</label>
-                  <textarea rows={5} placeholder="Paste the full JD here…"
-                    className="w-full text-xs border border-surface-200 rounded-xl p-3 outline-none focus:border-brand-400 resize-none text-ink-secondary placeholder:text-ink-muted" />
-                </div>
-                <div>
-                  <label className="text-xs text-ink-tertiary block mb-1.5">Select CV to score</label>
-                  <select className="w-full text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none mb-3 text-ink-secondary">
-                    <option>APM CV</option>
-                    <option>PM CV</option>
-                    <option>Project Manager CV</option>
-                    <option>Program Manager CV</option>
-                    <option>Business Analyst CV</option>
-                  </select>
-                  <button className="w-full bg-brand-600 text-white text-xs font-medium py-2.5 rounded-xl hover:bg-brand-700 transition-colors flex items-center justify-center gap-2">
-                    <BrainCircuit size={13} /> Analyse with AI
-                  </button>
-                  <p className="text-xs text-ink-muted mt-2 text-center">Uses Claude AI · ~5 sec</p>
+                  <p className="text-xs text-ink-tertiary">
+                    Claude reads your uploaded CV (PDF) and scores it against a job description
+                  </p>
                 </div>
               </div>
 
-              {/* Sample result */}
-              <div className="mt-4 p-4 bg-emerald-50 border border-emerald-100 rounded-xl">
-                <div className="flex items-center justify-between mb-3">
-                  <span className="text-xs font-semibold text-emerald-800">Sample result — PM CV vs Razorpay APM JD</span>
-                  <span className="text-2xl font-semibold text-emerald-600">88<span className="text-sm">/100</span></span>
+              {cvOptions.length === 0 && !cvLoadError && (
+                <div className="text-xs text-ink-tertiary p-3 bg-surface-50 border border-surface-200 rounded-xl">
+                  Loading your uploaded CVs…
                 </div>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <div>
-                    <p className="text-xs font-medium text-emerald-700 mb-1.5">Strengths</p>
-                    {['Product metrics experience', 'Agile / Scrum background', 'B2B SaaS context'].map(s => (
-                      <p key={s} className="text-xs text-emerald-600 flex gap-1.5 mb-1"><span>✓</span>{s}</p>
+              )}
+
+              {cvLoadError && (
+                <div className="text-xs text-red-600 p-3 bg-red-50 border border-red-200 rounded-xl mb-3">
+                  {cvLoadError}
+                </div>
+              )}
+
+              {cvOptions.length === 0 && cvLoadError === null && !analyzing && (
+                <div className="text-xs text-amber-700 p-3 bg-amber-50 border border-amber-200 rounded-xl">
+                  No CVs uploaded yet. Go to <a href="/settings" className="underline font-medium">Settings</a> and upload at least one CV (PDF) to get started.
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs text-ink-tertiary block mb-1.5">Paste job description</label>
+                  <textarea
+                    rows={8}
+                    value={analysisJd}
+                    onChange={e => setAnalysisJd(e.target.value)}
+                    placeholder="Paste the full JD here…"
+                    className="w-full text-xs border border-surface-200 rounded-xl p-3 outline-none focus:border-brand-400 resize-none text-ink-secondary placeholder:text-ink-muted"
+                  />
+                </div>
+                <div className="flex flex-col">
+                  <label className="text-xs text-ink-tertiary block mb-1.5">Select CV to score</label>
+                  <select
+                    value={selectedCvId}
+                    onChange={e => setSelectedCvId(e.target.value)}
+                    disabled={cvOptions.length === 0}
+                    className="w-full text-xs border border-surface-200 rounded-xl px-3 py-2 outline-none mb-3 text-ink-secondary disabled:opacity-60"
+                  >
+                    {cvOptions.length === 0 && <option value="">— no CVs uploaded —</option>}
+                    {cvOptions.map(c => (
+                      <option key={c.id} value={c.id}>
+                        {ROLE_LABELS[c.roleType] || c.roleType} — {c.fileName} (v{c.version})
+                      </option>
                     ))}
-                  </div>
-                  <div>
-                    <p className="text-xs font-medium text-red-700 mb-1.5">Gaps</p>
-                    {['No fintech domain mention', 'Missing OKR framework', 'Low SQL/data skill evidence'].map(s => (
-                      <p key={s} className="text-xs text-red-500 flex gap-1.5 mb-1"><span>✗</span>{s}</p>
-                    ))}
-                  </div>
-                  <div>
-                    <p className="text-xs font-medium text-amber-700 mb-1.5">Add these keywords</p>
-                    {['UPI', 'payment gateway', 'NPS', 'product discovery', 'A/B testing', 'GTM'].map(k => (
-                      <span key={k} className="inline-block text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-lg mr-1 mb-1">{k}</span>
-                    ))}
-                  </div>
+                  </select>
+                  <button
+                    onClick={runCvAnalysis}
+                    disabled={analyzing || !analysisJd.trim() || !selectedCvId}
+                    className="w-full bg-brand-600 text-white text-xs font-medium py-2.5 rounded-xl hover:bg-brand-700 transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <BrainCircuit size={13} className={analyzing ? 'animate-pulse' : ''} />
+                    {analyzing ? 'Analysing… (~10-30s)' : 'Analyse with AI'}
+                  </button>
+                  <p className="text-xs text-ink-muted mt-2 text-center">Uses Claude · reads PDF directly</p>
                 </div>
               </div>
+
+              {analysisError && (
+                <div className="mt-4 text-xs text-red-700 p-3 bg-red-50 border border-red-200 rounded-xl">
+                  {analysisError}
+                </div>
+              )}
+
+              {analysisResult && !analysisError && (
+                <div className="mt-4 p-4 bg-emerald-50 border border-emerald-100 rounded-xl">
+                  <div className="flex items-center justify-between mb-3">
+                    <span className="text-xs font-semibold text-emerald-800">
+                      Analysis result — {ROLE_LABELS[cvOptions.find(c => c.id === selectedCvId)?.roleType || ''] || 'Selected CV'}
+                      {analysisResult.recommendedCvRole && ` · Best CV for this JD: ${ROLE_LABELS[analysisResult.recommendedCvRole] || analysisResult.recommendedCvRole}`}
+                    </span>
+                    <span className="text-2xl font-semibold" style={{
+                      color: analysisResult.matchScore >= 80 ? '#10b981'
+                           : analysisResult.matchScore >= 60 ? '#f59e0b'
+                           : '#ef4444'
+                    }}>
+                      {analysisResult.matchScore}<span className="text-sm">/100</span>
+                    </span>
+                  </div>
+                  {analysisResult.summary && (
+                    <p className="text-xs text-ink-secondary mb-3 leading-relaxed">{analysisResult.summary}</p>
+                  )}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                      <p className="text-xs font-medium text-emerald-700 mb-1.5">Strengths</p>
+                      {analysisResult.strengths.length === 0
+                        ? <p className="text-xs text-ink-muted italic">None identified</p>
+                        : analysisResult.strengths.map((s, i) => (
+                            <p key={i} className="text-xs text-emerald-600 flex gap-1.5 mb-1"><span>✓</span>{s}</p>
+                          ))
+                      }
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium text-red-700 mb-1.5">Gaps</p>
+                      {analysisResult.gaps.length === 0
+                        ? <p className="text-xs text-ink-muted italic">None identified</p>
+                        : analysisResult.gaps.map((s, i) => (
+                            <p key={i} className="text-xs text-red-500 flex gap-1.5 mb-1"><span>✗</span>{s}</p>
+                          ))
+                      }
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium text-amber-700 mb-1.5">Add these keywords</p>
+                      {analysisResult.keywords.length === 0
+                        ? <p className="text-xs text-ink-muted italic">None suggested</p>
+                        : analysisResult.keywords.map((k, i) => (
+                            <span key={i} className="inline-block text-xs bg-amber-100 text-amber-700 px-2 py-0.5 rounded-lg mr-1 mb-1">{k}</span>
+                          ))
+                      }
+                    </div>
+                  </div>
+                  {analysisResult.suggestions.length > 0 && (
+                    <div className="mt-3 pt-3 border-t border-emerald-200">
+                      <p className="text-xs font-medium text-emerald-800 mb-1.5">Suggestions</p>
+                      {analysisResult.suggestions.map((s, i) => (
+                        <p key={i} className="text-xs text-emerald-700 mb-1">• {s}</p>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Post-application insights */}
@@ -868,52 +1099,70 @@ export default function Dashboard() {
                 <div className="w-7 h-7 rounded-lg bg-emerald-100 flex items-center justify-center">
                   <TrendingUp size={14} className="text-emerald-600" />
                 </div>
-                <div>
+                <div className="flex-1">
                   <h2 className="text-sm font-semibold text-ink-primary">Post-application insights</h2>
                   <p className="text-xs text-ink-tertiary">What's working and what to change — based on your real outcomes</p>
                 </div>
               </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                <div className="p-4 bg-emerald-50 border border-emerald-100 rounded-xl">
-                  <p className="text-xs font-semibold text-emerald-800 mb-2">What's getting interviews</p>
-                  {['PM roles at product startups', 'Roles mentioning "growth"', 'Bengaluru / Remote listings', 'Match score &gt;80'].map(s => (
-                    <p key={s} className="text-xs text-emerald-600 mb-1">→ {s}</p>
-                  ))}
-                </div>
-                <div className="p-4 bg-red-50 border border-red-100 rounded-xl">
-                  <p className="text-xs font-semibold text-red-800 mb-2">What's not working</p>
-                  {['MNC program manager roles', 'Roles needing PMP cert', 'Roles with 5yr+ experience', 'Job boards: IIMJobs'].map(s => (
-                    <p key={s} className="text-xs text-red-500 mb-1">✗ {s}</p>
-                  ))}
-                </div>
-                <div className="p-4 bg-brand-50 border border-brand-100 rounded-xl">
-                  <p className="text-xs font-semibold text-brand-800 mb-2">CV improvements</p>
-                  {['Add SQL project to BA CV', 'Quantify APM metrics more', 'Add fintech keywords to PM CV', 'Shorten PM CV to 1 page'].map(s => (
-                    <p key={s} className="text-xs text-brand-600 mb-1">• {s}</p>
-                  ))}
-                </div>
-              </div>
-              <button className="mt-4 w-full sm:w-auto text-xs font-medium px-4 py-2 border border-surface-200 rounded-xl text-ink-secondary hover:bg-surface-100 transition-colors flex items-center gap-2">
-                <BrainCircuit size={13} /> Regenerate insights from latest data
-              </button>
-            </div>
 
-            {/* Interview conversion by role */}
-            <div className="bg-white rounded-2xl border border-surface-200 p-5">
-              <h2 className="text-sm font-semibold text-ink-primary mb-4">Interview conversion rate by role</h2>
-              <ResponsiveContainer width="100%" height={160}>
-                <BarChart data={[
-                  { role: 'APM', rate: 3.7 }, { role: 'PM', rate: 2.8 },
-                  { role: 'Project Mgr', rate: 2.6 }, { role: 'Program Mgr', rate: 0 },
-                  { role: 'BA', rate: 0 },
-                ]}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#f1f3f9" />
-                  <XAxis dataKey="role" tick={{ fontSize: 11, fill: '#8b92a9' }} axisLine={false} tickLine={false} />
-                  <YAxis tickFormatter={v => `${v}%`} tick={{ fontSize: 11, fill: '#8b92a9' }} axisLine={false} tickLine={false} />
-                  <Tooltip formatter={(v: any) => [`${v}%`, 'Interview rate']} contentStyle={{ borderRadius: 10, border: '1px solid #e4e7f0', fontSize: 12 }} />
-                  <Bar dataKey="rate" fill="#6366f1" radius={[6,6,0,0]} />
-                </BarChart>
-              </ResponsiveContainer>
+              {!insights && !insightsLoading && !insightsError && (
+                <div className="text-xs text-ink-tertiary p-3 bg-surface-50 border border-surface-200 rounded-xl">
+                  Click "Generate insights" to have Claude analyse patterns across your applied jobs.
+                </div>
+              )}
+
+              {insightsLoading && (
+                <div className="text-xs text-ink-tertiary p-3 bg-surface-50 border border-surface-200 rounded-xl">
+                  Analysing your application history… (~10-20s)
+                </div>
+              )}
+
+              {insightsError && (
+                <div className="text-xs text-red-700 p-3 bg-red-50 border border-red-200 rounded-xl">
+                  {insightsError}
+                </div>
+              )}
+
+              {insights && !insightsLoading && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  <div className="p-4 bg-emerald-50 border border-emerald-100 rounded-xl">
+                    <p className="text-xs font-semibold text-emerald-800 mb-2">What's working</p>
+                    {(insights.successPatterns || []).length === 0
+                      ? <p className="text-xs text-ink-muted italic">Not enough applied/interview data yet</p>
+                      : insights.successPatterns.map((s, i) => (
+                          <p key={i} className="text-xs text-emerald-600 mb-1">→ {s}</p>
+                        ))
+                    }
+                  </div>
+                  <div className="p-4 bg-red-50 border border-red-100 rounded-xl">
+                    <p className="text-xs font-semibold text-red-800 mb-2">What's not working</p>
+                    {(insights.failPatterns || []).length === 0
+                      ? <p className="text-xs text-ink-muted italic">No rejection patterns yet</p>
+                      : insights.failPatterns.map((s, i) => (
+                          <p key={i} className="text-xs text-red-500 mb-1">✗ {s}</p>
+                        ))
+                    }
+                  </div>
+                  <div className="p-4 bg-brand-50 border border-brand-100 rounded-xl">
+                    <p className="text-xs font-semibold text-brand-800 mb-2">CV improvements</p>
+                    {(insights.cvImprovements || []).length === 0
+                      ? <p className="text-xs text-ink-muted italic">No suggestions yet</p>
+                      : insights.cvImprovements.map((s, i) => (
+                          <p key={i} className="text-xs text-brand-600 mb-1">• {s}</p>
+                        ))
+                    }
+                  </div>
+                </div>
+              )}
+
+              <button
+                onClick={refreshInsights}
+                disabled={insightsLoading}
+                className="mt-4 w-full sm:w-auto text-xs font-medium px-4 py-2 border border-surface-200 rounded-xl text-ink-secondary hover:bg-surface-100 transition-colors flex items-center gap-2 disabled:opacity-60"
+              >
+                <BrainCircuit size={13} className={insightsLoading ? 'animate-pulse' : ''} />
+                {insightsLoading ? 'Generating…' : insights ? 'Regenerate insights' : 'Generate insights'}
+              </button>
             </div>
           </div>
         )}
