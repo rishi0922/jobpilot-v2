@@ -102,9 +102,17 @@ interface JobDetail extends Job {
 
 // ---- Components ----
 
-function StatCard({ label, value, sub, color }: { label: string; value: string | number; sub?: string; color?: string }) {
+function StatCard({ label, value, sub, color, onClick }: { label: string; value: string | number; sub?: string; color?: string; onClick?: () => void }) {
+  const clickable = typeof onClick === 'function'
   return (
-    <div className="bg-white rounded-2xl p-4 border border-surface-200 flex flex-col gap-1 animate-slide-up">
+    <div
+      onClick={onClick}
+      role={clickable ? 'button' : undefined}
+      tabIndex={clickable ? 0 : undefined}
+      className={`bg-white rounded-2xl p-4 border border-surface-200 flex flex-col gap-1 animate-slide-up ${
+        clickable ? 'cursor-pointer hover:border-brand-300 hover:shadow-sm transition-all' : ''
+      }`}
+    >
       <p className="text-xs text-ink-tertiary font-medium tracking-wide uppercase">{label}</p>
       <p className={`text-3xl font-semibold ${color || 'text-ink-primary'}`}>{value}</p>
       {sub && <p className="text-xs text-ink-tertiary">{sub}</p>}
@@ -160,8 +168,15 @@ export default function Dashboard() {
   const [detailJobId, setDetailJobId] = useState<string | null>(null)
   const [detail, setDetail] = useState<JobDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
-  // Sort state for the jobs list — defaults to highest match score first
-  const [sortBy, setSortBy] = useState<'matchScore' | 'scrapedAt'>('matchScore')
+  // Sort state for the jobs list — defaults to newest scraped first so the
+  // freshest results are always at the top. Users can switch to match-score
+  // sort from the dropdown.
+  const [sortBy, setSortBy] = useState<'matchScore' | 'scrapedAt'>('scrapedAt')
+  // Client-side pagination of the filtered list — 50 cards per page.
+  const [currentPage, setCurrentPage] = useState(1)
+  const JOBS_PER_PAGE = 50
+  // True while a bulk-retry of all FAILED jobs is in flight.
+  const [retryingAll, setRetryingAll] = useState(false)
 
   const loadStats = useCallback(async () => {
     try {
@@ -214,6 +229,13 @@ export default function Dashboard() {
 
   useEffect(() => { loadJobs() }, [loadJobs])
 
+  // Whenever the filter/search/sort inputs change, jump back to page 1 so the
+  // user always sees results from the top of the new filter — otherwise the
+  // page index can point past the end of the new (often shorter) list.
+  useEffect(() => {
+    setCurrentPage(1)
+  }, [filterRole, filterSource, filterStatus, filterScrapedWindow, search, sortBy])
+
   const filteredJobs = jobs
     .filter(j => {
       const matchRole = !filterRole || j.roleType === filterRole
@@ -233,7 +255,19 @@ export default function Dashboard() {
       return new Date(b.scrapedAt).getTime() - new Date(a.scrapedAt).getTime()
     })
 
+  // 50-per-page slice of the filtered/sorted list. `totalPages` is at least 1
+  // so the pagination bar still renders sensibly on an empty list.
+  const totalPages    = Math.max(1, Math.ceil(filteredJobs.length / JOBS_PER_PAGE))
+  const safePage      = Math.min(currentPage, totalPages)
+  const pageStart     = (safePage - 1) * JOBS_PER_PAGE
+  const pageEnd       = pageStart + JOBS_PER_PAGE
+  const paginatedJobs = filteredJobs.slice(pageStart, pageEnd)
+
   const manualPendingJobs = jobs.filter(j => j.status === 'FOUND' && !autoApply)
+  // FAILED jobs visible in the *currently loaded* set — bulk retry only acts
+  // on what's loaded, so the user sees a count they can verify against the
+  // page. (Server may have more FAILED jobs further back in time.)
+  const failedJobsLoaded  = jobs.filter(j => j.status === 'FAILED')
 
   function toggleApplyMode() {
     setAutoApply(prev => !prev)
@@ -257,6 +291,30 @@ export default function Dashboard() {
     } catch (err) {
       console.error(err)
       loadJobs()
+    }
+  }
+
+  /** Re-queue every FAILED job in the currently loaded set. Each is PATCHed
+   *  to status=QUEUED with applyMode=AUTO so the apply-queue worker will
+   *  pick it up on its next pass. We do them sequentially to avoid
+   *  hammering Prisma/the DB with parallel writes on a small instance. */
+  async function retryAllFailed() {
+    if (failedJobsLoaded.length === 0 || retryingAll) return
+    setRetryingAll(true)
+    // Optimistic UI: flip all of them to QUEUED locally first.
+    setJobs(prev => prev.map(j => j.status === 'FAILED' ? { ...j, status: 'QUEUED' } : j))
+    try {
+      for (const fj of failedJobsLoaded) {
+        try {
+          await patchJob(fj.id, { status: 'QUEUED', applyMode: 'AUTO' })
+        } catch (e) {
+          console.error(`retry failed for job ${fj.id}`, e)
+        }
+      }
+    } finally {
+      setRetryingAll(false)
+      loadJobs()
+      loadStats()
     }
   }
 
@@ -418,7 +476,16 @@ export default function Dashboard() {
           />
           <StatCard label="In review" value={stats.inReview} color="text-amber-500" />
           <StatCard label="Interviews" value={stats.interviews} color="text-emerald-500" sub={`${stats.successRate}% rate`} />
-          <StatCard label="Failed" value={stats.failed} color="text-red-400" sub={stats.failed > 0 ? 'Need retry' : 'All clean'} />
+          <StatCard
+            label="Failed"
+            value={stats.failed}
+            color="text-red-400"
+            sub={stats.failed > 0 ? 'Click to retry →' : 'All clean'}
+            onClick={stats.failed > 0 ? () => {
+              setActiveTab('jobs')
+              setFilterStatus('FAILED')
+            } : undefined}
+          />
         </div>
 
         {/* Tabs */}
@@ -562,9 +629,36 @@ export default function Dashboard() {
               </select>
             </div>
 
-            {/* Job cards */}
+            {/* Bulk-retry banner — only shown when the user is filtering to
+                FAILED jobs (e.g. after clicking the Failed stat card). Gives
+                a one-click way to re-queue everything that's loaded. */}
+            {filterStatus === 'FAILED' && failedJobsLoaded.length > 0 && (
+              <div className="mb-3 bg-red-50 border border-red-200 rounded-2xl p-3 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 animate-slide-down">
+                <div className="flex items-start gap-2">
+                  <AlertCircle size={16} className="text-red-500 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-sm font-medium text-red-800">
+                      {failedJobsLoaded.length} failed application{failedJobsLoaded.length === 1 ? '' : 's'} loaded
+                    </p>
+                    <p className="text-xs text-red-600">
+                      Retry will re-queue them for the apply worker. You can also retry one-by-one with the per-card button.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={retryAllFailed}
+                  disabled={retryingAll}
+                  className="flex items-center gap-1.5 text-xs font-medium px-4 py-2 bg-red-600 text-white rounded-xl hover:bg-red-700 transition-colors disabled:opacity-60 disabled:cursor-not-allowed whitespace-nowrap"
+                >
+                  <RotateCcw size={12} className={retryingAll ? 'animate-spin' : ''} />
+                  {retryingAll ? 'Retrying…' : `Retry all ${failedJobsLoaded.length}`}
+                </button>
+              </div>
+            )}
+
+            {/* Job cards — only the current page slice. */}
             <div className="space-y-2">
-              {filteredJobs.map((job, i) => (
+              {paginatedJobs.map((job, i) => (
                 <div key={job.id}
                   className="job-card bg-white border border-surface-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center gap-3 hover:border-brand-300 transition-colors"
                   style={{ animationDelay: `${i * 30}ms` }}>
@@ -650,28 +744,52 @@ export default function Dashboard() {
                 </div>
               )}
 
-              {/* Pagination footer: result count + load more.
-                  `jobs.length` is what came back from the server for the
-                  current page size; `jobsTotal` is the total matching rows
-                  on the server. When local search/sort filters further, we
-                  show both numbers so it's clear what's hidden. */}
+              {/* Pagination footer.
+                  - Left: "Showing X–Y of Z" describing the current page
+                    against the filtered list, plus a Load-more link if the
+                    server has rows we haven't fetched yet.
+                  - Right: Previous / Page N of M / Next page controls. */}
               {filteredJobs.length > 0 && (
                 <div className="pt-4 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-ink-tertiary">
-                  <span>
-                    Showing <span className="text-ink-secondary font-medium">{filteredJobs.length}</span>
-                    {filteredJobs.length !== jobs.length && (
-                      <> filtered · <span className="text-ink-secondary font-medium">{jobs.length}</span> loaded</>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                    <span>
+                      Showing{' '}
+                      <span className="text-ink-secondary font-medium">{pageStart + 1}–{Math.min(pageEnd, filteredJobs.length)}</span>
+                      {' '}of <span className="text-ink-secondary font-medium">{filteredJobs.length}</span>
+                      {filteredJobs.length !== jobs.length && (
+                        <> filtered (<span className="text-ink-secondary font-medium">{jobs.length}</span> loaded)</>
+                      )}
+                      {' · '}<span className="text-ink-muted">{jobsTotal} total on server</span>
+                    </span>
+                    {jobs.length < jobsTotal && (
+                      <button
+                        onClick={() => setJobsPageSize(s => s + 300)}
+                        className="text-brand-600 hover:underline font-medium"
+                      >
+                        Load {Math.min(300, jobsTotal - jobs.length)} more from server
+                      </button>
                     )}
-                    {' '}of <span className="text-ink-secondary font-medium">{jobsTotal}</span> total
-                  </span>
-                  {jobs.length < jobsTotal && (
+                  </div>
+
+                  <div className="flex items-center gap-1">
                     <button
-                      onClick={() => setJobsPageSize(s => s + 300)}
-                      className="px-4 py-2 border border-surface-200 bg-white rounded-xl text-ink-secondary hover:bg-surface-100 transition-colors font-medium"
+                      onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+                      disabled={safePage <= 1}
+                      className="px-3 py-1.5 border border-surface-200 bg-white rounded-lg text-ink-secondary hover:bg-surface-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                     >
-                      Load more ({jobsTotal - jobs.length} remaining)
+                      Previous
                     </button>
-                  )}
+                    <span className="px-2 text-ink-tertiary">
+                      Page <span className="text-ink-secondary font-medium">{safePage}</span> of <span className="text-ink-secondary font-medium">{totalPages}</span>
+                    </span>
+                    <button
+                      onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+                      disabled={safePage >= totalPages}
+                      className="px-3 py-1.5 border border-surface-200 bg-white rounded-lg text-ink-secondary hover:bg-surface-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      Next
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
