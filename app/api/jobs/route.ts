@@ -8,15 +8,34 @@ export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url)
     const roleType = searchParams.get('roleType')
-    const status = searchParams.get('status')
-    const source = searchParams.get('source')
-    const page = parseInt(searchParams.get('page') || '1')
-    const limit = parseInt(searchParams.get('limit') || '50')
+    const status   = searchParams.get('status')
+    const source   = searchParams.get('source')
+    const page     = parseInt(searchParams.get('page') || '1')
+    const limit    = parseInt(searchParams.get('limit') || '50')
+    // Date filter — `scrapedAfter` is an ISO timestamp; jobs with scrapedAt
+    // strictly later than this are returned. Lets the UI offer "today / last
+    // 7 days / last 30 days" filters without server-side date math.
+    const scrapedAfter  = searchParams.get('scrapedAfter')
+    const scrapedBefore = searchParams.get('scrapedBefore')
 
     const where: any = {}
     if (roleType) where.roleType = roleType
-    if (status) where.status = status
-    if (source) where.source = source
+    if (status)   where.status   = status
+    if (source)   where.source   = source
+    if (scrapedAfter || scrapedBefore) {
+      where.scrapedAt = {}
+      if (scrapedAfter) {
+        const d = new Date(scrapedAfter)
+        if (!isNaN(d.getTime())) where.scrapedAt.gte = d
+      }
+      if (scrapedBefore) {
+        const d = new Date(scrapedBefore)
+        if (!isNaN(d.getTime())) where.scrapedAt.lte = d
+      }
+      // If neither parsed cleanly, drop the empty filter entirely so Prisma
+      // doesn't choke on `{ scrapedAt: {} }`.
+      if (Object.keys(where.scrapedAt).length === 0) delete where.scrapedAt
+    }
 
     const [jobs, total] = await Promise.all([
       prisma.job.findMany({

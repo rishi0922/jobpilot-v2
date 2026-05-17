@@ -143,7 +143,16 @@ export default function Dashboard() {
   const [filterRole, setFilterRole] = useState('')
   const [filterSource, setFilterSource] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
+  // Scraped-date filter: 'all' | 'today' | '7d' | '30d'
+  const [filterScrapedWindow, setFilterScrapedWindow] = useState<'all' | 'today' | '7d' | '30d'>('all')
   const [search, setSearch] = useState('')
+  // Total matching rows on the server, so we can show "Showing X of Y" and
+  // hide the Load-more button once we've fetched everything.
+  const [jobsTotal, setJobsTotal] = useState(0)
+  // Client-side pagination — bumps the server `limit` to load more rows.
+  // Default page size is generous so a typical run (200-300 jobs) fits in
+  // one fetch; users can click Load-more if they have more.
+  const [jobsPageSize, setJobsPageSize] = useState(300)
   const [scraperRunning, setScraperRunning] = useState(false)
   const [scraperMessage, setScraperMessage] = useState<string | null>(null)
   const [loadingData, setLoadingData] = useState(true)
@@ -167,18 +176,32 @@ export default function Dashboard() {
 
   const loadJobs = useCallback(async () => {
     try {
-      const params = new URLSearchParams({ limit: '100' })
+      const params = new URLSearchParams({ limit: String(jobsPageSize) })
       if (filterRole) params.set('roleType', filterRole)
       if (filterSource) params.set('source', filterSource.toLowerCase())
       if (filterStatus) params.set('status', filterStatus)
+      // Scraped-date window → ISO timestamp passed to the API as scrapedAfter.
+      if (filterScrapedWindow !== 'all') {
+        const now = new Date()
+        const after = new Date(now)
+        if (filterScrapedWindow === 'today') {
+          after.setHours(0, 0, 0, 0)
+        } else if (filterScrapedWindow === '7d') {
+          after.setDate(now.getDate() - 7)
+        } else if (filterScrapedWindow === '30d') {
+          after.setDate(now.getDate() - 30)
+        }
+        params.set('scrapedAfter', after.toISOString())
+      }
       const res = await fetch(`/api/jobs?${params}`, { cache: 'no-store' })
       if (!res.ok) return
       const data = await res.json()
       setJobs(data.jobs || [])
+      setJobsTotal(typeof data.total === 'number' ? data.total : (data.jobs?.length || 0))
     } catch (err) {
       console.error('Failed to load jobs', err)
     }
-  }, [filterRole, filterSource, filterStatus])
+  }, [filterRole, filterSource, filterStatus, filterScrapedWindow, jobsPageSize])
 
   useEffect(() => {
     Promise.all([loadStats(), loadJobs()]).finally(() => setLoadingData(false))
@@ -521,6 +544,17 @@ export default function Dashboard() {
                 <option value="">All statuses</option>
                 {Object.entries(STATUS_CONFIG).map(([v, c]) => <option key={v} value={v}>{c.label}</option>)}
               </select>
+              <select
+                value={filterScrapedWindow}
+                onChange={e => setFilterScrapedWindow(e.target.value as any)}
+                className="bg-white border border-surface-200 rounded-xl px-3 py-2 text-xs text-ink-secondary outline-none"
+                title="Filter by when the job was scraped"
+              >
+                <option value="all">Scraped: anytime</option>
+                <option value="today">Scraped: today</option>
+                <option value="7d">Scraped: last 7 days</option>
+                <option value="30d">Scraped: last 30 days</option>
+              </select>
               <select value={sortBy} onChange={e => setSortBy(e.target.value as any)}
                 className="bg-white border border-surface-200 rounded-xl px-3 py-2 text-xs text-ink-secondary outline-none">
                 <option value="matchScore">Sort: Best match</option>
@@ -543,7 +577,8 @@ export default function Dashboard() {
                       )}
                     </div>
                     <p className="text-xs text-ink-tertiary mt-1">
-                      {job.company} · {job.location || '—'} · <span className="text-brand-600">{job.source}</span>
+                      {job.company || <span className="text-ink-muted italic">company hidden</span>} · {job.location || '—'} · <span className="text-brand-600">{job.source}</span>
+                      <> · Scraped {new Date(job.scrapedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}</>
                       {job.appliedAt && <> · Applied {new Date(job.appliedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}</>}
                     </p>
                   </button>
@@ -612,6 +647,31 @@ export default function Dashboard() {
                 <div className="text-center py-16 text-ink-tertiary">
                   <Briefcase size={32} className="mx-auto mb-3 opacity-30" />
                   <p className="text-sm">No jobs match your filters</p>
+                </div>
+              )}
+
+              {/* Pagination footer: result count + load more.
+                  `jobs.length` is what came back from the server for the
+                  current page size; `jobsTotal` is the total matching rows
+                  on the server. When local search/sort filters further, we
+                  show both numbers so it's clear what's hidden. */}
+              {filteredJobs.length > 0 && (
+                <div className="pt-4 flex flex-col sm:flex-row items-center justify-between gap-3 text-xs text-ink-tertiary">
+                  <span>
+                    Showing <span className="text-ink-secondary font-medium">{filteredJobs.length}</span>
+                    {filteredJobs.length !== jobs.length && (
+                      <> filtered · <span className="text-ink-secondary font-medium">{jobs.length}</span> loaded</>
+                    )}
+                    {' '}of <span className="text-ink-secondary font-medium">{jobsTotal}</span> total
+                  </span>
+                  {jobs.length < jobsTotal && (
+                    <button
+                      onClick={() => setJobsPageSize(s => s + 300)}
+                      className="px-4 py-2 border border-surface-200 bg-white rounded-xl text-ink-secondary hover:bg-surface-100 transition-colors font-medium"
+                    >
+                      Load more ({jobsTotal - jobs.length} remaining)
+                    </button>
+                  )}
                 </div>
               )}
             </div>
