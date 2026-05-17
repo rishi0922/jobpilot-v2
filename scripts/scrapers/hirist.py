@@ -1,42 +1,181 @@
-"""Hirist.tech scraper — no login required"""
+"""
+Hirist.tech scraper.
+
+Hirist's `it-jobs-in-india/<slug>-jobs` URL pattern has been replaced by a
+straight `/search/<slug>-jobs` route in the current site. The earlier scraper
+also raced the JS render — the listings appear after a `/api/v1/search` XHR.
+
+This rewrite:
+  - Tries the current `/search/...` URL plus the legacy URL shape.
+  - Waits for networkidle to let the listings load.
+  - Walks card selectors then falls back to anchor scraping.
+"""
+
 from datetime import datetime
-from playwright.async_api import async_playwright
 from urllib.parse import quote
 
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+
+from ._common import (
+    build_rich_description,
+    collect_tag_texts,
+    new_stealth_context,
+    normalize_url,
+    looks_like_target_role,
+    try_link_selectors,
+    try_selectors,
+)
+
+BASE = "https://www.hirist.tech"
+
+
+def _search_urls(query: str) -> list[str]:
+    slug = quote(query.replace(" ", "-").lower())
+    q = quote(query)
+    return [
+        f"{BASE}/search/{slug}-jobs",
+        f"{BASE}/jobs/{slug}",
+        f"{BASE}/it-jobs-in-india/{slug}-jobs",  # legacy
+        f"{BASE}/search?q={q}",
+    ]
+
+
 async def scrape_hirist(queries: list[str], _credentials: dict) -> list[dict]:
-    jobs = []
-    BASE = "https://www.hirist.tech"
+    jobs: list[dict] = []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         )
+        context = await new_stealth_context(browser)
         page = await context.new_page()
 
         for query in queries:
             try:
-                url = f"{BASE}/it-jobs-in-india/{quote(query.replace(' ', '-'))}-jobs"
-                await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                await page.wait_for_timeout(2000)
-                cards = await page.query_selector_all(".jobpost, .job-listing article")
-                for card in cards[:20]:
-                    try:
-                        t = await card.query_selector("h2 a, .job-title a")
-                        c = await card.query_selector(".company-name, .company")
-                        l = await card.query_selector(".location")
-                        title   = (await t.inner_text()).strip() if t else ""
-                        company = (await c.inner_text()).strip() if c else ""
-                        loc     = (await l.inner_text()).strip() if l else ""
-                        href    = await t.get_attribute("href")  if t else None
-                        if title and href:
-                            url2 = href if href.startswith("http") else f"{BASE}{href}"
-                            jobs.append({"title": title, "company": company, "location": loc,
-                                         "sourceUrl": url2, "salary": None,
-                                         "scrapedAt": datetime.utcnow().isoformat()})
-                    except Exception:
-                        continue
+                found = await _scrape_one_query(page, query)
+                jobs.extend(found)
+                print(f"[hirist] '{query}' → {len(found)} jobs")
             except Exception as e:
-                print(f"[hirist] {query}: {e}")
+                print(f"[hirist] '{query}': {type(e).__name__}: {e}")
 
+        await context.close()
         await browser.close()
     return jobs
+
+
+async def _scrape_one_query(page, query: str) -> list[dict]:
+    for url in _search_urls(query):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except PlaywrightTimeout:
+                pass
+            await page.wait_for_timeout(1500)
+
+            found = await _extract_cards(page)
+            if found:
+                return found
+        except PlaywrightTimeout:
+            print(f"[hirist] timeout {url}")
+        except Exception as e:
+            print(f"[hirist] {url}: {type(e).__name__}: {e}")
+    return []
+
+
+async def _extract_cards(page) -> list[dict]:
+    card_selectors = [
+        ".jobpost",
+        ".job-listing article",
+        ".job-card",
+        ".job-tuple",
+        "article.searchListing",
+        "div[class*='JobCard']",
+    ]
+    cards = []
+    for sel in card_selectors:
+        cards = await page.query_selector_all(sel)
+        if cards:
+            break
+
+    out: list[dict] = []
+    if cards:
+        for card in cards[:25]:
+            try:
+                title = await try_selectors(card, [
+                    "h2 a", "h3 a", ".job-title a", "a.title", ".jobtitle",
+                ])
+                company = await try_selectors(card, [
+                    ".company-name", ".company", ".orgname", ".jcompname",
+                ])
+                loc = await try_selectors(card, [
+                    ".location", ".loc", ".joblocation",
+                ])
+                href = await try_link_selectors(card, [
+                    "h2 a", "h3 a", ".job-title a", "a[href*='/j/']", "a[href*='/job/']", "a",
+                ])
+                if not title or not href:
+                    continue
+
+                # Hirist cards expose experience-range, posted-when, skill
+                # chips and a short blurb. Pull them all into the description
+                # field so match-scoring has more to work with.
+                experience = await try_selectors(card, [
+                    ".exp", ".experience", ".jobexp", ".years-exp",
+                ])
+                desc = await try_selectors(card, [
+                    ".jobdesc", ".job-desc", ".job-description", ".description",
+                ])
+                posted = await try_selectors(card, [
+                    ".posted-date", ".date", ".jobtime", ".time",
+                ])
+                salary = await try_selectors(card, [
+                    ".salary", ".sal", ".ctc",
+                ])
+                skills = ""
+                for tags_root in ("ul.skills", "ul.tags", ".skill-list", ".jobtags"):
+                    skills = await collect_tag_texts(card, tags_root, "li")
+                    if skills:
+                        break
+
+                out.append({
+                    "title":     title,
+                    "company":   company,
+                    "location":  loc or "India",
+                    "salary":    salary or None,
+                    "sourceUrl": normalize_url(BASE, href),
+                    "description": build_rich_description(
+                        desc, experience=experience, skills=skills, posted=posted
+                    ),
+                    "scrapedAt": datetime.utcnow().isoformat(),
+                })
+            except Exception:
+                continue
+        if out:
+            return out
+
+    anchors = await page.query_selector_all(
+        "a[href*='/j/'], a[href*='/job/'], a[href*='/jobs/']"
+    )
+    seen: set[str] = set()
+    for a in anchors[:60]:
+        try:
+            href = await a.get_attribute("href")
+            text = (await a.inner_text() or "").strip()
+            if not href or not text or href in seen:
+                continue
+            seen.add(href)
+            line = text.splitlines()[0].strip()
+            if not looks_like_target_role(line):
+                continue
+            out.append({
+                "title":     line[:200],
+                "company":   "",
+                "location":  "India",
+                "salary":    None,
+                "sourceUrl": normalize_url(BASE, href),
+                "scrapedAt": datetime.utcnow().isoformat(),
+            })
+        except Exception:
+            continue
+    return out
