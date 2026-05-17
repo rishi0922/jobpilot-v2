@@ -1,140 +1,227 @@
 """
 Naukri.com scraper.
 
-The previous implementation HTML-scraped `.srp-jobtuple-wrapper` cards in a
-headless Chromium. Naukri ships selector changes almost monthly and aggressively
-fingerprints Playwright, so that path returned 0 jobs more often than not.
+Why this is browser-only:
 
-This rewrite uses Naukri's own public mobile/web search JSON API as the primary
-path. The endpoint is what `naukri.com/jobs-in-india` itself calls in the
-background — it returns a stable, structured payload of job objects and only
-needs two header tokens (`appid`, `systemid`) plus a realistic User-Agent. If
-the API ever changes or starts rate-limiting our IP, we fall back to the older
-HTML-scraping path so the source isn't a total blackout.
+  A direct HTTP call to Naukri's JSON search API
+  (https://www.naukri.com/jobapi/v3/search) now returns HTTP 406 with
+  `{"message":"recaptcha required"}` — confirmed live. So the "fast HTTP path"
+  the previous version of this scraper used as primary doesn't work anymore
+  no matter what headers we send.
 
-Endpoint reference (no official docs, observed from the production app):
-    GET https://www.naukri.com/jobapi/v3/search
-        ?keyword=<query>&pageNo=1&noOfResults=30
-        &urlType=search_by_keyword&searchType=adv&experience=0&location=india
-    Headers required: appid: 109, systemid: Naukri
+  The SEO landing pages
+  (https://www.naukri.com/{role-slug}-jobs-in-{location}-{offset}) DO render,
+  but only client-side: the HTML body is a vanilla Next.js shell that hydrates
+  jobs via XHR after page load. That XHR runs inside the real browser, where
+  cookies and bot-check tokens are set automatically, so the same JSON API
+  that 406s for httpx returns 200 for a real Playwright page.
+
+Strategy:
+
+  1. Load the SEO URL in Playwright.
+  2. Once the page has settled, run `page.evaluate(fetch('/jobapi/v3/search'))`
+     to pull the JSON API response with first-party cookies attached. Each
+     job object is rich (title, company, location, salary, description,
+     skills, posted date) — much better than DOM-scraping.
+  3. If that fails for any reason, fall back to scraping the rendered
+     `.srp-jobtuple-wrapper` cards directly.
+  4. Paginate via `-20`, `-40`, ... URL suffixes until a page returns zero
+     jobs or we hit our page cap.
+
+Pagination quirk we handle: `/.../india-0` 301s to `/.../india` (no suffix),
+but `/.../india-20`, `/.../india-40` resolve directly. We never request `-0`.
 """
 
-import re
 from datetime import datetime
 from typing import Optional
 from urllib.parse import quote
 
-import httpx
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 from ._common import (
-    REAL_BROWSER_HEADERS,
-    REAL_UA,
     build_rich_description,
     collect_tag_texts,
     new_stealth_context,
     normalize_url,
-    safe_attr,
-    safe_text,
     try_link_selectors,
     try_selectors,
 )
 
 BASE_URL = "https://www.naukri.com"
 
-# Headers needed to talk to the Naukri search JSON API. The `appid` and
-# `systemid` tokens come from the production web bundle — they identify the
-# request as coming from the desktop site rather than a third-party scraper.
-API_HEADERS = {
-    **REAL_BROWSER_HEADERS,
-    "User-Agent": REAL_UA,
-    "appid": "109",
-    "systemid": "Naukri",
-    "Referer": f"{BASE_URL}/",
-    "Origin": BASE_URL,
-    "clientid": "d3skt0p",
-    "Accept": "application/json",
-}
+# How many SEO-URL pages to crawl per query. 3 × 20 = up to 60 jobs/query.
+HTML_PAGES_PER_QUERY = 3
+HTML_RESULTS_PER_PAGE = 20
 
 
 async def scrape_naukri(queries: list[str], credentials: dict) -> list[dict]:
-    """Scrape Naukri for each query. Tries the JSON API first, then the HTML
-    page as a fallback if the API path returns nothing for a given query."""
+    """Scrape Naukri for each query.
+
+    All paths run inside a single Playwright session because the JSON API
+    requires the bot-check cookie that Naukri sets after the first page load.
+    """
     jobs: list[dict] = []
     seen: set[str] = set()
 
-    # ── JSON API path (preferred) ──────────────────────────────────────────
-    async with httpx.AsyncClient(headers=API_HEADERS, timeout=30.0) as client:
-        for query in queries:
-            try:
-                api_jobs = await _fetch_api(client, query)
-                if not api_jobs:
-                    print(f"[naukri] API returned 0 for '{query}' — will try HTML fallback")
-                for j in api_jobs:
-                    url = j.get("sourceUrl")
-                    if not url or url in seen:
-                        continue
-                    seen.add(url)
-                    jobs.append(j)
-                print(f"[naukri] API '{query}' → {len(api_jobs)} jobs")
-            except Exception as e:
-                print(f"[naukri] API '{query}': {type(e).__name__}: {e}")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        context = await new_stealth_context(browser)
+        page = await context.new_page()
 
-    # ── HTML fallback (used only for queries the API found nothing for) ────
-    html_queries = [q for q in queries if not _query_present_in(jobs, q)]
-    if html_queries:
+        # Visit the homepage once so Naukri can set its first-party cookies
+        # (bot-check token, geo, etc.). This is what lets the subsequent
+        # JSON API calls succeed instead of returning HTTP 406.
         try:
-            html_jobs = await _scrape_html(html_queries, credentials)
-            for j in html_jobs:
-                url = j.get("sourceUrl")
-                if not url or url in seen:
-                    continue
-                seen.add(url)
-                jobs.append(j)
-            print(f"[naukri] HTML fallback contributed {len(html_jobs)} jobs across {len(html_queries)} queries")
+            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8000)
+            except PlaywrightTimeout:
+                pass
         except Exception as e:
-            print(f"[naukri] HTML fallback failed: {type(e).__name__}: {e}")
+            print(f"[naukri] homepage warm-up failed: {type(e).__name__}: {e}")
+
+        if credentials.get("username") and credentials.get("password"):
+            await _login(page, credentials)
+
+        for query in queries:
+            kept_for_query = 0
+
+            # ── Per-query pagination ────────────────────────────────────
+            for page_idx in range(HTML_PAGES_PER_QUERY):
+                offset = page_idx * HTML_RESULTS_PER_PAGE
+                url = _seo_url(query, offset)
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                except PlaywrightTimeout:
+                    print(f"[naukri] timeout loading {url}")
+                    break
+                except Exception as e:
+                    print(f"[naukri] error loading {url}: {type(e).__name__}: {e}")
+                    break
+
+                # Wait for either the JSON XHR to settle OR the cards to render.
+                try:
+                    await page.wait_for_selector(
+                        "div.srp-jobtuple-wrapper, article.jobTuple",
+                        timeout=12000,
+                    )
+                except PlaywrightTimeout:
+                    # Cards didn't appear. Could be that the JSON path responded
+                    # but the renderer hasn't drawn yet. We still try the
+                    # in-browser API fetch below before giving up.
+                    pass
+
+                # ── Path A: in-browser JSON fetch ───────────────────────
+                # Run from inside the page so the request carries the
+                # cookies Naukri set during the page load. This is what
+                # bypasses the recaptcha-required 406 the direct httpx
+                # call gets.
+                api_rows = await _fetch_via_page(page, query, page_idx + 1)
+                added_from_api = 0
+                for row in api_rows:
+                    src = row.get("sourceUrl")
+                    if not src or src in seen:
+                        continue
+                    seen.add(src)
+                    jobs.append(row)
+                    added_from_api += 1
+
+                # ── Path B: rendered-DOM fallback for this page ─────────
+                added_from_dom = 0
+                if added_from_api == 0:
+                    dom_rows = await _scrape_rendered_cards(page)
+                    for row in dom_rows:
+                        src = row.get("sourceUrl")
+                        if not src or src in seen:
+                            continue
+                        seen.add(src)
+                        jobs.append(row)
+                        added_from_dom += 1
+
+                added_this_page = added_from_api + added_from_dom
+                kept_for_query += added_this_page
+                tag = "api" if added_from_api else "dom"
+                print(
+                    f"[naukri] '{query}' page={page_idx+1} offset={offset} "
+                    f"+{added_this_page} ({tag})"
+                )
+
+                # If a page returned nothing, further pages probably will too.
+                if added_this_page == 0:
+                    break
+
+            print(f"[naukri] '{query}' → {kept_for_query} jobs across "
+                  f"{HTML_PAGES_PER_QUERY} pages")
+
+        await context.close()
+        await browser.close()
 
     return jobs
 
 
-def _query_present_in(jobs: list[dict], query: str) -> bool:
-    """Did the JSON API path already turn up at least one job whose title
-    matches this query? Used to decide whether HTML fallback is worth the
-    Playwright cost for that query."""
-    q_tokens = [t for t in re.split(r"\s+", query.lower()) if t]
-    if not q_tokens:
-        return True
-    for j in jobs:
-        title = (j.get("title") or "").lower()
-        if all(tok in title for tok in q_tokens):
-            return True
-    return False
+def _seo_url(query: str, offset: int) -> str:
+    """Build the Naukri SEO landing URL. `offset=0` redirects to the no-suffix
+    URL — we skip that 301 by using the bare URL when offset is 0."""
+    slug = query.replace(" ", "-").lower()
+    if offset == 0:
+        return f"{BASE_URL}/{slug}-jobs-in-india"
+    return f"{BASE_URL}/{slug}-jobs-in-india-{offset}"
 
 
-async def _fetch_api(client: httpx.AsyncClient, query: str) -> list[dict]:
-    """One page of search results via the JSON API."""
+# ── Path A: in-browser JSON fetch ───────────────────────────────────────────
+
+async def _fetch_via_page(page, query: str, page_no: int) -> list[dict]:
+    """Call Naukri's JSON search API from inside the rendered page, so
+    cookies + bot-check tokens are attached automatically. Returns [] on any
+    failure — caller falls back to rendered-DOM scraping."""
     params = {
-        "noOfResults": 30,
+        "noOfResults": HTML_RESULTS_PER_PAGE,
         "urlType":     "search_by_keyword",
         "searchType":  "adv",
         "keyword":     query,
-        "pageNo":      1,
+        "pageNo":      page_no,
         "experience":  "0",
         "location":    "india",
         "k":           query,
-        "seoKey":      f"{query.replace(' ', '-')}-jobs",
+        "seoKey":      f"{query.replace(' ', '-').lower()}-jobs",
     }
-    r = await client.get(f"{BASE_URL}/jobapi/v3/search", params=params)
-    if r.status_code != 200:
-        print(f"[naukri] API HTTP {r.status_code} for '{query}'")
-        return []
+    qs = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    js = """
+    async ({qs}) => {
+      try {
+        const r = await fetch('/jobapi/v3/search?' + qs, {
+          headers: {
+            'appid': '109',
+            'systemid': 'Naukri',
+            'clientid': 'd3skt0p',
+            'Accept': 'application/json',
+          },
+          credentials: 'include',
+        });
+        if (!r.ok) return { error: 'HTTP ' + r.status };
+        const json = await r.json();
+        return { json };
+      } catch (e) {
+        return { error: String(e) };
+      }
+    }
+    """
     try:
-        data = r.json()
+        result = await page.evaluate(js, {"qs": qs})
     except Exception as e:
-        print(f"[naukri] API non-JSON response for '{query}': {e}")
+        print(f"[naukri] in-browser fetch error: {type(e).__name__}: {e}")
         return []
 
+    if not isinstance(result, dict):
+        return []
+    if "error" in result:
+        print(f"[naukri] in-browser API error: {result.get('error')}")
+        return []
+
+    data = result.get("json") or {}
     out: list[dict] = []
     for j in data.get("jobDetails", []) or []:
         title = (j.get("title") or "").strip()
@@ -142,8 +229,6 @@ async def _fetch_api(client: httpx.AsyncClient, query: str) -> list[dict]:
             continue
         company = (j.get("companyName") or "").strip()
 
-        # `placeholders` is Naukri's flat list of label/value pairs that
-        # mixes location, salary, experience, etc. We pull only what we need.
         placeholders = j.get("placeholders") or []
         location = _placeholder(placeholders, "location") or "India"
         salary   = _placeholder(placeholders, "salary")
@@ -152,24 +237,27 @@ async def _fetch_api(client: httpx.AsyncClient, query: str) -> list[dict]:
         href = j.get("jdURL") or j.get("staticUrl") or ""
         if not href:
             continue
-        url = href if href.startswith("http") else f"{BASE_URL}{href}"
-        url = url.split("?")[0]  # drop tracking suffix
+        href = href if href.startswith("http") else f"{BASE_URL}{href}"
+        href = href.split("?")[0]
 
-        # `createdDate` is a millis-epoch on the API. Convert to ISO.
-        posted_at = _ms_epoch_to_iso(j.get("createdDate"))
+        # Tag chips on the listing card
+        tags = j.get("tagsAndSkills") or ""
+        if isinstance(tags, list):
+            tags = ", ".join(str(t) for t in tags if t)
 
         out.append({
             "title":       title,
             "company":     company,
             "location":    location,
             "salary":      salary,
-            "sourceUrl":   url,
-            "description": (j.get("jobDescription") or "").strip() or None,
-            "postedAt":    posted_at,
+            "sourceUrl":   href,
+            "description": build_rich_description(
+                (j.get("jobDescription") or "").strip(),
+                experience=exp or "",
+                skills=tags or "",
+            ),
+            "postedAt":    _ms_epoch_to_iso(j.get("createdDate")),
             "scrapedAt":   datetime.utcnow().isoformat(),
-            # Useful for debugging but the orchestrator overwrites "source"
-            # before ingest, so the value here is informational only.
-            "experience":  exp,
         })
     return out
 
@@ -185,8 +273,6 @@ def _placeholder(items: list[dict], kind: str) -> Optional[str]:
 
 
 def _ms_epoch_to_iso(ms: object) -> Optional[str]:
-    """Naukri timestamps are millis-since-epoch. Convert to ISO; return None
-    on anything weird so the ingest endpoint sees a clean null."""
     if not ms:
         return None
     try:
@@ -195,155 +281,24 @@ def _ms_epoch_to_iso(ms: object) -> Optional[str]:
         return None
 
 
-# ── HTML fallback ───────────────────────────────────────────────────────────
-#
-# URL shape + selector set are adapted from somranal2799/naukri-job-scraper-dashboard,
-# a Selenium-based public Naukri scraper. We port the patterns into Playwright
-# rather than introducing Selenium (which would mean a second headless browser
-# stack on the Render free tier — memory we can't spare).
-#
-# Key things adopted from that repo:
-#   - SEO URL with numeric pagination: /{role-slug}-jobs-in-{location}-{offset}.
-#     Naukri serves these to crawlers without auth and they paginate cleanly.
-#   - A richer selector set: span.expwdth, span.job-desc, span.job-post-day,
-#     ul.tags-gt li, a.comp-name — these capture experience, description,
-#     posted date, and skills, all of which feed the match-score calculation.
-#   - Page-level wait keyed off the card selector instead of a fixed sleep.
-#
-# We keep the older query-param URL (?experience=0,5&location=india) as a
-# secondary shape in case Naukri serves a different layout to that endpoint.
+# ── Path B: rendered-DOM card scrape ────────────────────────────────────────
 
-# 3 pages × 20 jobs per query is the same volume the upstream repo collects.
-HTML_PAGES_PER_QUERY = 3
-HTML_RESULTS_PER_PAGE = 20
-
-# Locations to iterate when the orchestrator hasn't given us one. "india" matches
-# the upstream repo's default and works as a country-wide SEO landing page.
-DEFAULT_LOCATIONS = ["india"]
-
-
-def _html_search_urls(query: str) -> list[str]:
-    """Build the list of paginated URLs we should crawl for a query.
-
-    Order matters: the SEO `/{slug}-jobs-in-{loc}-{offset}` shape comes first
-    because that's the one that consistently renders the `.srp-jobtuple-wrapper`
-    card markup. We then add a query-param URL as a fallback in case Naukri
-    A/B-tests a different layout for that path.
-    """
-    slug = query.replace(" ", "-").lower()
-    urls: list[str] = []
-    for loc in DEFAULT_LOCATIONS:
-        for page in range(HTML_PAGES_PER_QUERY):
-            offset = page * HTML_RESULTS_PER_PAGE
-            urls.append(f"{BASE_URL}/{slug}-jobs-in-{loc}-{offset}")
-    # One fallback URL with the legacy query-param style
-    urls.append(f"{BASE_URL}/{slug}-jobs?experience=0,5&location=india")
-    return urls
-
-
-async def _scrape_html(queries: list[str], credentials: dict) -> list[dict]:
-    """Playwright fallback. Stealth context + paginated SEO URLs + multi-selector
-    card extraction. URL pattern and selectors adapted from the upstream repo
-    we were pointed at; we use Playwright instead of Selenium so we don't have
-    to add a second browser stack to the Render deploy."""
-    jobs: list[dict] = []
-    seen: set[str] = set()
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
-        context = await new_stealth_context(browser)
-        page = await context.new_page()
-
-        if credentials.get("username") and credentials.get("password"):
-            await _login(page, credentials)
-
-        for query in queries:
-            kept_for_query = 0
-            for url in _html_search_urls(query):
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-
-                    # Prefer waiting on the card selector itself (upstream pattern)
-                    # over networkidle — Naukri sometimes streams analytics XHRs
-                    # after listings render, which would block networkidle forever.
-                    try:
-                        await page.wait_for_selector(
-                            "article.jobTuple, div.srp-jobtuple-wrapper",
-                            timeout=10000,
-                        )
-                    except PlaywrightTimeout:
-                        # Fall back to a short networkidle then continue —
-                        # the page may have rendered with a different layout.
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=5000)
-                        except PlaywrightTimeout:
-                            pass
-
-                    cards = await page.query_selector_all(
-                        "div.srp-jobtuple-wrapper, article.jobTuple, .jobTuple"
-                    )
-                    page_count = 0
-                    if cards:
-                        for card in cards[:HTML_RESULTS_PER_PAGE]:
-                            row = await _parse_card(card)
-                            if not row:
-                                continue
-                            if row["sourceUrl"] in seen:
-                                continue
-                            seen.add(row["sourceUrl"])
-                            jobs.append(row)
-                            page_count += 1
-
-                    if page_count == 0:
-                        # Last-resort generic anchor scrape: every job listing has
-                        # a link to /job-listings/... — pick those titles directly.
-                        anchors = await page.query_selector_all("a[href*='/job-listings/']")
-                        for a in anchors[:25]:
-                            try:
-                                href = await a.get_attribute("href")
-                                text = (await a.inner_text() or "").strip()
-                                if not href or not text:
-                                    continue
-                                full = normalize_url(BASE_URL, href)
-                                if full in seen:
-                                    continue
-                                seen.add(full)
-                                jobs.append({
-                                    "title":     text.splitlines()[0][:200],
-                                    "company":   "",
-                                    "location":  "India",
-                                    "salary":    None,
-                                    "sourceUrl": full,
-                                    "scrapedAt": datetime.utcnow().isoformat(),
-                                })
-                                page_count += 1
-                            except Exception:
-                                continue
-
-                    kept_for_query += page_count
-                    # If a page returned nothing, no point paginating further
-                    # for the same query — that's the upstream repo's behaviour.
-                    if page_count == 0:
-                        break
-
-                except PlaywrightTimeout:
-                    print(f"[naukri] HTML timeout for '{query}' @ {url}")
-                except Exception as e:
-                    print(f"[naukri] HTML error for '{query}' @ {url}: {type(e).__name__}: {e}")
-            print(f"[naukri] HTML '{query}' → {kept_for_query} jobs across {HTML_PAGES_PER_QUERY} pages")
-
-        await context.close()
-        await browser.close()
-    return jobs
+async def _scrape_rendered_cards(page) -> list[dict]:
+    """Walk the rendered `.srp-jobtuple-wrapper` cards. Used when the
+    in-browser API fetch failed. Selector list is the union of what we had
+    plus what the upstream `naukri-job-scraper-dashboard` repo uses."""
+    out: list[dict] = []
+    cards = await page.query_selector_all(
+        "div.srp-jobtuple-wrapper, article.jobTuple, .jobTuple"
+    )
+    for card in cards[:HTML_RESULTS_PER_PAGE]:
+        row = await _parse_card(card)
+        if row:
+            out.append(row)
+    return out
 
 
 async def _parse_card(card) -> Optional[dict]:
-    """Pull title / company / location / salary / experience / description /
-    posted / skills out of a single Naukri job card. Selector list is the
-    union of what we had before plus what the upstream repo uses, so the
-    parser keeps working when only some classes are renamed in a redesign."""
     try:
         title = await try_selectors(card, [
             "a.title", ".title", ".jobTitle", "a.jobTitle", "h2 a",
@@ -355,9 +310,8 @@ async def _parse_card(card) -> Optional[dict]:
             return None
 
         company = await try_selectors(card, [
-            "a.comp-name",  # upstream selector — distinct from ".comp-name" which
-                           # the previous scraper used and which doesn't always match
-            ".comp-name", ".companyInfo a", ".subTitle", ".company-name",
+            "a.comp-name", ".comp-name", ".companyInfo a",
+            ".subTitle", ".company-name",
         ])
         loc = await try_selectors(card, [
             "span.locWdth", ".locWdth", ".location", ".loc", ".job-location",
@@ -375,7 +329,7 @@ async def _parse_card(card) -> Optional[dict]:
             "span.job-post-day", ".job-post-day", ".date", ".posted",
         ])
 
-        # Skills tags. Naukri uses `ul.tags-gt` for the per-card skill chips.
+        # Skill chips
         skills_text = await collect_tag_texts(card, "ul.tags-gt", "li")
 
         return {
@@ -387,20 +341,19 @@ async def _parse_card(card) -> Optional[dict]:
             "description": build_rich_description(
                 desc, experience=experience, skills=skills_text, posted=posted
             ),
-            "postedAt":    None,  # text like "1 day ago" — leave None rather than try to parse
+            "postedAt":    None,  # text like "1 day ago" — leave as null
             "scrapedAt":   datetime.utcnow().isoformat(),
-            "experience":  experience or None,
         }
     except Exception:
         return None
 
 
+# ── Login ───────────────────────────────────────────────────────────────────
+
 async def _login(page, creds: dict):
     try:
         await page.goto(f"{BASE_URL}/nlogin/login", wait_until="domcontentloaded", timeout=20000)
         await page.wait_for_timeout(1500)
-        # Naukri has shipped at least three login form layouts over the past
-        # year; try each placeholder in turn.
         for sel in [
             'input[placeholder*="Enter your active Email ID"]',
             'input[placeholder*="Email"]',

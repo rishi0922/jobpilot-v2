@@ -208,21 +208,25 @@ export function scoreJob(job: ScoringJob, profile: ScoringProfile | null): Scori
 
 
 /**
- * Quality gate — return null if the job should NOT be saved at all.
- * Otherwise return a "soft-rejected" reason for the caller to log, or undefined
- * if the job passes cleanly.
+ * Quality gate — return null if the job should be saved, or a short reason
+ * string if it should be dropped.
  *
- * Hard rejections (return string + treat as drop):
- *   - Stale (postedAt > 60 days ago)
- *   - Senior-level title slipped past the role classifier
- *   - Missing essentials (title, sourceUrl)
- *   - Suspiciously short description with no salary AND no company
+ * Hard drops (the only reasons a job is rejected):
+ *   - Missing essentials (no title or no sourceUrl)
+ *   - Stale: postedAt is more than 60 days ago
+ *   - Senior-level title that slipped past the role classifier
+ *
+ * Soft cases we intentionally do NOT drop on anymore:
+ *   - Missing company. IIMJobs and Hirist often don't expose the company
+ *     name on the search-results card (you click through to see it). When
+ *     we dropped on `missing-company`, an entire IIMJobs run of 106 jobs
+ *     was silently discarded. The UI gracefully renders an empty company
+ *     field, so it's better to keep the row and let the user click through.
  */
 export function qualityGateReason(
   job: { title: string; company: string; description: string | null; postedAt: Date | null; sourceUrl: string }
 ): string | null {
   if (!job.title?.trim() || !job.sourceUrl?.trim()) return 'missing-essentials'
-  if (!job.company?.trim())                          return 'missing-company'
 
   if (job.postedAt) {
     const ageDays = (Date.now() - job.postedAt.getTime()) / (1000 * 60 * 60 * 24)

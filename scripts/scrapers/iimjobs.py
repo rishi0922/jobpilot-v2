@@ -34,6 +34,32 @@ from ._common import (
 
 BASE = "https://www.iimjobs.com"
 
+
+def _company_from_title(title: str) -> str:
+    """IIMJobs job listings frequently roll the company name into the title
+    when the company chooses not to surface it as a separate field. Typical
+    shapes:
+        "AVP - Product Strategy - Fintech | XYZ Bank"
+        "Manager - Product (5-8 yrs) - ABC Corp"
+        "Senior PM @ Some Startup"
+    We try a few of these patterns to pull a usable company hint. Returns ''
+    if nothing matched — that's fine, the row is still kept after the recent
+    quality-gate loosening, the company column just renders empty."""
+    if not title:
+        return ""
+    for sep in (" | ", " @ ", " - ", " — "):
+        if sep in title:
+            tail = title.rsplit(sep, 1)[-1].strip()
+            # Skip tails that are obviously not a company (years, parens, …)
+            if (
+                2 <= len(tail) <= 60
+                and "(" not in tail
+                and not any(ch.isdigit() for ch in tail[:3])
+                and not tail.lower().startswith(("yrs", "years"))
+            ):
+                return tail
+    return ""
+
 # Several URL shapes have been live for the IIMJobs search page across the past
 # year — we try them in order. The first one to actually return results wins.
 def _search_urls(query: str) -> list[str]:
@@ -140,7 +166,15 @@ async def _extract_cards(page) -> list[dict]:
                 ])
                 company = await try_selectors(card, [
                     ".company-name", ".company", ".sr-company-name", ".org-name",
+                    # Newer layouts wrap company in a generic link inside the row
+                    "a.sr-company", "[class*='company']",
                 ])
+                # IIMJobs hides the company on many listings (you have to click
+                # through). When that's the case the title is often shaped like
+                # "Role - Some Description | Company Name". Try to parse out
+                # something useful so the dashboard isn't full of blank cells.
+                if not company:
+                    company = _company_from_title(title)
                 loc = await try_selectors(card, [
                     ".location", ".loc", ".sr-location",
                 ])
