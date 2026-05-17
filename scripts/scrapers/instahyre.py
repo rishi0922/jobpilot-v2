@@ -1,25 +1,73 @@
-"""Instahyre scraper"""
-import asyncio
+"""
+Instahyre scraper.
+
+Instahyre is a React SPA — the previous scraper waited on `domcontentloaded`
+and queried `.opportunity-info, .job-card` immediately, which is why it
+returned 0 results: those classes don't exist until the React tree mounts and
+the listings XHR resolves.
+
+This rewrite:
+  - Uses stealth headers.
+  - Waits for the listings XHR to finish via networkidle, then scrolls a
+    couple of times to trigger lazy-load.
+  - Tries multiple search URL shapes.
+  - Walks a list of card selectors and a generic anchor fallback.
+
+Instahyre's `/api/v1/jobs/` endpoint is gated behind a session cookie, so we
+don't hit the API directly — the HTML path with proper waits is good enough.
+"""
+
 from datetime import datetime
-from playwright.async_api import async_playwright
 from urllib.parse import quote
 
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+
+from ._common import (
+    build_rich_description,
+    collect_tag_texts,
+    new_stealth_context,
+    normalize_url,
+    looks_like_target_role,
+    try_link_selectors,
+    try_selectors,
+)
+
+BASE = "https://www.instahyre.com"
+
+
+def _search_urls(query: str) -> list[str]:
+    q = quote(query)
+    return [
+        f"{BASE}/job-search/?q={q}&location=India",
+        f"{BASE}/jobs/?q={q}&location=India",
+        f"{BASE}/search?q={q}",
+    ]
+
+
 async def scrape_instahyre(queries: list[str], credentials: dict) -> list[dict]:
-    jobs = []
-    BASE = "https://www.instahyre.com"
+    jobs: list[dict] = []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         )
+        context = await new_stealth_context(browser)
         page = await context.new_page()
 
         if credentials.get("username") and credentials.get("password"):
             try:
                 await page.goto(f"{BASE}/login/", wait_until="domcontentloaded", timeout=20000)
                 await page.wait_for_timeout(1500)
-                await page.fill('input[name="email"], input[type="email"]', credentials["username"])
-                await page.fill('input[name="password"], input[type="password"]', credentials["password"])
+                for sel in ['input[name="email"]', 'input[type="email"]', "#email"]:
+                    el = await page.query_selector(sel)
+                    if el:
+                        await el.fill(credentials["username"])
+                        break
+                for sel in ['input[name="password"]', 'input[type="password"]', "#password"]:
+                    el = await page.query_selector(sel)
+                    if el:
+                        await el.fill(credentials["password"])
+                        break
                 await page.click('button[type="submit"]')
                 await page.wait_for_timeout(3000)
             except Exception as e:
@@ -27,29 +75,143 @@ async def scrape_instahyre(queries: list[str], credentials: dict) -> list[dict]:
 
         for query in queries:
             try:
-                url = f"{BASE}/jobs/?q={quote(query)}&location=India"
-                await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                await page.wait_for_timeout(2000)
-                cards = await page.query_selector_all(".opportunity-info, .job-card")
-                for card in cards[:20]:
-                    try:
-                        t = await card.query_selector(".role, .job-title, h2")
-                        c = await card.query_selector(".company-name, .company")
-                        l = await card.query_selector(".location")
-                        a = await card.query_selector("a")
-                        title   = (await t.inner_text()).strip() if t else ""
-                        company = (await c.inner_text()).strip() if c else ""
-                        loc     = (await l.inner_text()).strip() if l else ""
-                        href    = await a.get_attribute("href")  if a else None
-                        if title and href:
-                            url2 = href if href.startswith("http") else f"{BASE}{href}"
-                            jobs.append({"title": title, "company": company, "location": loc,
-                                         "sourceUrl": url2, "salary": None,
-                                         "scrapedAt": datetime.utcnow().isoformat()})
-                    except Exception:
-                        continue
+                found = await _scrape_one_query(page, query)
+                jobs.extend(found)
+                print(f"[instahyre] '{query}' → {len(found)} jobs")
             except Exception as e:
-                print(f"[instahyre] {query}: {e}")
+                print(f"[instahyre] '{query}': {type(e).__name__}: {e}")
 
+        await context.close()
         await browser.close()
     return jobs
+
+
+async def _scrape_one_query(page, query: str) -> list[dict]:
+    for url in _search_urls(query):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except PlaywrightTimeout:
+                pass
+
+            # Trigger lazy-load: scroll twice with a short pause
+            for _ in range(2):
+                await page.evaluate("window.scrollBy(0, 800)")
+                await page.wait_for_timeout(800)
+
+            found = await _extract_cards(page)
+            if found:
+                return found
+        except PlaywrightTimeout:
+            print(f"[instahyre] timeout {url}")
+        except Exception as e:
+            print(f"[instahyre] {url}: {type(e).__name__}: {e}")
+    return []
+
+
+async def _extract_cards(page) -> list[dict]:
+    card_selectors = [
+        ".opportunity-info",
+        ".job-card",
+        ".job-listing",
+        ".opportunity-card",
+        "[data-test='job-card']",
+        "div.row.opportunity",
+        "li.job",
+    ]
+    cards = []
+    for sel in card_selectors:
+        cards = await page.query_selector_all(sel)
+        if cards:
+            break
+
+    out: list[dict] = []
+    if cards:
+        for card in cards[:25]:
+            try:
+                title = await try_selectors(card, [
+                    ".role", ".job-title", "h2", "h3", ".designation", "a.title",
+                ])
+                company = await try_selectors(card, [
+                    ".company-name", ".company", ".employer",
+                ])
+                loc = await try_selectors(card, [
+                    ".location", ".loc", ".job-location",
+                ])
+                href = await try_link_selectors(card, [
+                    "a[href*='/jobs/']", "a[href*='/opportunity']", "a",
+                ])
+                if not title or not href:
+                    continue
+
+                # Instahyre's opportunity card shows experience-required, the
+                # match-percent badge, and a stack-of-skills row. Capture the
+                # bits that are useful for keyword-based match scoring.
+                experience = await try_selectors(card, [
+                    ".experience", ".exp", ".years-of-exp", ".min-exp",
+                ])
+                desc = await try_selectors(card, [
+                    ".job-description", ".description", ".excerpt", ".summary",
+                ])
+                salary = await try_selectors(card, [
+                    ".salary", ".compensation", ".ctc",
+                ])
+                posted = await try_selectors(card, [
+                    ".posted-on", ".time-posted", ".date",
+                ])
+                skills = ""
+                for tags_root in (".skills", ".skill-list", "ul.skill-tags", ".technologies"):
+                    skills = await collect_tag_texts(card, tags_root, "li")
+                    if skills:
+                        break
+                if not skills:
+                    # Some layouts use a div with span chips instead of <li>
+                    for tags_root in (".skills", ".skill-list"):
+                        skills = await collect_tag_texts(card, tags_root, "span")
+                        if skills:
+                            break
+
+                out.append({
+                    "title":     title,
+                    "company":   company,
+                    "location":  loc or "India",
+                    "salary":    salary or None,
+                    "sourceUrl": normalize_url(BASE, href),
+                    "description": build_rich_description(
+                        desc, experience=experience, skills=skills, posted=posted
+                    ),
+                    "scrapedAt": datetime.utcnow().isoformat(),
+                })
+            except Exception:
+                continue
+        if out:
+            return out
+
+    # Generic anchor fallback. Instahyre job pages live under /opportunity/<id>
+    # and /jobs/<id>.
+    anchors = await page.query_selector_all(
+        "a[href*='/opportunity'], a[href*='/jobs/']"
+    )
+    seen: set[str] = set()
+    for a in anchors[:60]:
+        try:
+            href = await a.get_attribute("href")
+            text = (await a.inner_text() or "").strip()
+            if not href or not text or href in seen:
+                continue
+            seen.add(href)
+            line = text.splitlines()[0].strip()
+            if not looks_like_target_role(line):
+                continue
+            out.append({
+                "title":     line[:200],
+                "company":   "",
+                "location":  "India",
+                "salary":    None,
+                "sourceUrl": normalize_url(BASE, href),
+                "scrapedAt": datetime.utcnow().isoformat(),
+            })
+        except Exception:
+            continue
+    return out
