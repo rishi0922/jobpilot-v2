@@ -109,6 +109,29 @@ async def get_credentials(site: str) -> dict:
         print(f"[creds] {site}: {type(e).__name__}: {e}")
         return {}
 
+async def fetch_known_urls() -> set[str]:
+    """Pull the set of sourceUrls already stored in the DB so we can skip them
+    before doing the expensive parse/score/upsert work. Returns an empty set
+    on any failure — a missed dedup is just wasted work, not a correctness
+    bug (DB-level @unique constraint is still the source of truth)."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                f"{NEXT_APP_URL}/api/scraper/known-urls",
+                headers={"x-api-key": SCRAPER_API_KEY},
+            )
+            if r.status_code != 200:
+                print(f"[known-urls] HTTP {r.status_code} — proceeding without dedup seed")
+                return set()
+            data = r.json()
+            urls = set(data.get("urls", []))
+            print(f"[known-urls] seeded {len(urls)} already-scraped URLs")
+            return urls
+    except Exception as e:
+        print(f"[known-urls] {type(e).__name__}: {e} — proceeding without dedup seed")
+        return set()
+
+
 async def save_jobs(jobs: list[dict], run_id: str):
     """Post scraped jobs back to Next.js API."""
     if not jobs:
@@ -152,7 +175,10 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
     We also flush jobs to the ingest endpoint after every site, so partial
     progress is preserved even if a later scraper crashes the container.
     """
-    seen_urls: set[str] = set()
+    # Seed the in-memory dedup set with URLs already in the DB. Cards whose URL
+    # is in this set will be dropped before we run quality-gate / scoring /
+    # upsert — saving the wasted work of re-processing the same job every run.
+    seen_urls: set[str] = await fetch_known_urls()
     total_saved = 0
 
     # Map source name -> a zero-arg async callable that returns its job list.
@@ -215,9 +241,13 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
         unique = []
         dropped_irrelevant = 0
         dropped_senior     = 0
+        dropped_known      = 0  # already in DB or already seen in this run
         for j in jobs or []:
             url = j.get("sourceUrl")
-            if not url or url in seen_urls:
+            if not url:
+                continue
+            if url in seen_urls:
+                dropped_known += 1
                 continue
             seen_urls.add(url)
 
@@ -240,8 +270,9 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
             unique.append(j)
 
         print(
-            f"[{name}] scraped {len(jobs or [])} → kept {len(unique)} "
-            f"(dropped {dropped_irrelevant} irrelevant, {dropped_senior} too-senior)"
+            f"[{name}] scraped {len(jobs or [])} → kept {len(unique)} new "
+            f"(dropped {dropped_known} already-known, {dropped_irrelevant} irrelevant, "
+            f"{dropped_senior} too-senior)"
         )
 
         # Flush after each source so partial progress survives container crashes.
