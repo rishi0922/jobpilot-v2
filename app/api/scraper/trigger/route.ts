@@ -5,7 +5,7 @@ export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
-const ALL_SOURCES = ['naukri', 'linkedin', 'iimjobs', 'instahyre', 'hirist', 'wellfound', 'mnc']
+const ALL_SOURCES = ['ats', 'naukri', 'linkedin', 'iimjobs', 'instahyre', 'hirist', 'wellfound', 'mnc']
 
 export async function POST(req: NextRequest) {
   // Auth: allow either an API-key header (GitHub Action / CLI) or a same-origin

@@ -382,6 +382,25 @@ export default function Dashboard() {
     }
   }
 
+  // Manually mark a job as applied — for when the user applied outside the
+  // auto-applicator (directly on the company site, an email referral, etc.).
+  // Sets applyMode=MANUAL so the dashboard can later distinguish auto-applied
+  // jobs from manually-tracked ones. PATCH /api/jobs sets `appliedAt`
+  // server-side whenever status becomes APPLIED.
+  async function handleMarkApplied(jobId: string) {
+    const nowIso = new Date().toISOString()
+    setJobs(prev => prev.map(j =>
+      j.id === jobId ? { ...j, status: 'APPLIED', appliedAt: nowIso } : j
+    ))
+    try {
+      await patchJob(jobId, { status: 'APPLIED', applyMode: 'MANUAL' })
+      loadStats()
+    } catch (err) {
+      console.error(err)
+      loadJobs()
+    }
+  }
+
   async function setFeedback(jobId: string, value: 'UP' | 'DOWN' | null) {
     // Toggle: if user clicks the same button again, clear it.
     const currentJob = jobs.find(j => j.id === jobId)
@@ -884,6 +903,18 @@ export default function Dashboard() {
                       </button>
                     )}
 
+                    {/* "Mark applied" — for when the user has applied outside
+                        the auto-applicator (direct on company site, referral,
+                        etc.). Shown for any status where the application step
+                        hasn't already happened. */}
+                    {['FOUND', 'QUEUED', 'FAILED', 'SKIPPED'].includes(job.status) && (
+                      <button onClick={() => handleMarkApplied(job.id)}
+                        title="I applied to this job manually"
+                        className="flex items-center gap-1 text-xs px-2 py-1 border border-sky-200 text-sky-700 bg-sky-50 rounded-lg hover:bg-sky-100 transition-colors">
+                        <CheckCircle2 size={10} /> Mark applied
+                      </button>
+                    )}
+
                     <a href={job.sourceUrl} target="_blank" rel="noopener noreferrer"
                       title="Open original posting"
                       className="p-1.5 text-ink-muted hover:text-brand-600 hover:bg-brand-50 rounded-lg transition-colors">
@@ -1281,6 +1312,13 @@ export default function Dashboard() {
                       <button onClick={() => { handleManualApply(detail.id); closeDetail() }}
                         className="flex items-center gap-1.5 text-xs font-medium px-3 py-2 border border-surface-200 text-ink-secondary rounded-xl hover:bg-surface-100 transition-colors">
                         <Send size={11} /> Apply now
+                      </button>
+                    )}
+                    {['FOUND', 'QUEUED', 'FAILED', 'SKIPPED'].includes(detail.status) && (
+                      <button onClick={() => { handleMarkApplied(detail.id); closeDetail() }}
+                        title="I applied to this job manually"
+                        className="flex items-center gap-1.5 text-xs font-medium px-3 py-2 border border-sky-200 text-sky-700 bg-sky-50 rounded-xl hover:bg-sky-100 transition-colors">
+                        <CheckCircle2 size={11} /> Mark applied
                       </button>
                     )}
                     <button onClick={() => setFeedback(detail.id, 'UP')}

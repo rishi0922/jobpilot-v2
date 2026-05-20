@@ -10,8 +10,21 @@ from pydantic import BaseModel
 from typing import Optional
 import asyncio
 import os
+import sys
 import httpx
 from datetime import datetime
+
+# Force line-buffered stdout/stderr so per-scraper print() output appears in
+# Render logs in real time. Without this, Python buffers prints in 4 KB blocks
+# under non-TTY (Docker/Render) and the user can't see what's happening in a
+# multi-minute background scrape until the process exits. Setting
+# PYTHONUNBUFFERED=1 in the Render env var does the same thing, but doing it
+# in code makes the deploy self-contained.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 from scrapers.naukri import scrape_naukri
 from scrapers.linkedin import scrape_linkedin
@@ -303,7 +316,7 @@ async def run_scrape(payload: ScrapeRequest, background: BackgroundTasks):
     for a multi-minute scrape to complete.
     """
     enabled = payload.sources or [
-        "naukri", "linkedin", "iimjobs", "instahyre", "hirist", "wellfound", "mnc"
+        "ats", "naukri", "linkedin", "iimjobs", "instahyre", "hirist", "wellfound", "mnc"
     ]
     run_id = payload.runId or f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
