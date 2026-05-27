@@ -60,18 +60,16 @@ async def scrape_instahyre(queries: list[str], credentials: dict) -> list[dict]:
             await _safe_login(page, credentials, "instahyre", f"{BASE}/login/")
 
         for query in queries:
-            # Per-query hard timeout. Each query has its own multi-URL retry
-            # inside `_scrape_one_query`, but if Instahyre's networkidle
-            # never fires (long-polling XHRs) the whole scraper hangs
-            # forever. 60s is enough for the 3 URL shapes × 25s gotos.
+            # 120s per query covers Instahyre's 3-URL retry × ~25s goto each
+            # plus the networkidle long-polling timeout.
             try:
                 found = await asyncio.wait_for(
-                    _scrape_one_query(page, query), timeout=60
+                    _scrape_one_query(page, query), timeout=120
                 )
                 jobs.extend(found)
                 print(f"[instahyre] '{query}' → {len(found)} jobs")
             except asyncio.TimeoutError:
-                print(f"[instahyre] '{query}' timed out after 60s")
+                print(f"[instahyre] '{query}' timed out after 120s")
             except Exception as e:
                 print(f"[instahyre] '{query}': {type(e).__name__}: {e}")
 

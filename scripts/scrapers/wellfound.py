@@ -57,14 +57,15 @@ async def scrape_wellfound(queries: list[str], _credentials: dict) -> list[dict]
         page = await context.new_page()
 
         for query in queries:
+            # 120s per query covers Wellfound's 4-URL retry × ~30s goto each.
             try:
                 found = await asyncio.wait_for(
-                    _scrape_one_query(page, query), timeout=60
+                    _scrape_one_query(page, query), timeout=120
                 )
                 jobs.extend(found)
                 print(f"[wellfound] '{query}' → {len(found)} jobs")
             except asyncio.TimeoutError:
-                print(f"[wellfound] '{query}' timed out after 60s")
+                print(f"[wellfound] '{query}' timed out after 120s")
             except Exception as e:
                 print(f"[wellfound] '{query}': {type(e).__name__}: {e}")
 

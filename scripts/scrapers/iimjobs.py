@@ -89,16 +89,17 @@ async def scrape_iimjobs(queries: list[str], credentials: dict) -> list[dict]:
             await _safe_login(page, credentials, "iimjobs", f"{BASE}/candidate/login")
 
         for query in queries:
-            # Per-query timeout — bounds each query to 60s so a single hung
-            # search doesn't burn the source's 4-minute outer budget.
+            # Per-query timeout. IIMJobs tries 4 URL shapes per query, each
+            # with its own ~25s goto + 8s networkidle. 120s budget lets all
+            # 4 fall through cleanly when the first one(s) are slow.
             try:
                 found_for_query = await asyncio.wait_for(
-                    _scrape_one_query(page, query), timeout=60
+                    _scrape_one_query(page, query), timeout=120
                 )
                 jobs.extend(found_for_query)
                 print(f"[iimjobs] '{query}' → {len(found_for_query)} jobs")
             except asyncio.TimeoutError:
-                print(f"[iimjobs] '{query}' timed out after 60s")
+                print(f"[iimjobs] '{query}' timed out after 120s")
             except Exception as e:
                 print(f"[iimjobs] '{query}': {type(e).__name__}: {e}")
 

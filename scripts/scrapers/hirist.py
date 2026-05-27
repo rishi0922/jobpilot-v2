@@ -52,14 +52,16 @@ async def scrape_hirist(queries: list[str], _credentials: dict) -> list[dict]:
         page = await context.new_page()
 
         for query in queries:
+            # 120s per query covers Hirist's 4-URL retry pattern (~25s goto
+            # × 4 URLs + networkidle/wait overhead).
             try:
                 found = await asyncio.wait_for(
-                    _scrape_one_query(page, query), timeout=60
+                    _scrape_one_query(page, query), timeout=120
                 )
                 jobs.extend(found)
                 print(f"[hirist] '{query}' → {len(found)} jobs")
             except asyncio.TimeoutError:
-                print(f"[hirist] '{query}' timed out after 60s")
+                print(f"[hirist] '{query}' timed out after 120s")
             except Exception as e:
                 print(f"[hirist] '{query}': {type(e).__name__}: {e}")
 

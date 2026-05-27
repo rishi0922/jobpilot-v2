@@ -249,12 +249,12 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
             # Per-source hard timeout. Without this, one broken/hanging scraper
             # (e.g. an Instahyre query that never resolves) blocks every
             # scraper queued after it — that's why we historically saw
-            # hirist/wellfound/mnc never running. 4 min per source is enough
-            # for 5 queries × 3 pages even with slow pages, but bounded so we
-            # always proceed to the next source.
-            jobs = await asyncio.wait_for(runner(), timeout=240)
+            # hirist/wellfound/mnc never running. 7 min per source covers
+            # 5 queries × ~80s each (4 URL shapes × ~25s goto + render time)
+            # with headroom for the login attempt and the closing teardown.
+            jobs = await asyncio.wait_for(runner(), timeout=420)
         except asyncio.TimeoutError:
-            print(f"[{name}] timed out after 240s — moving on")
+            print(f"[{name}] timed out after 420s — moving on")
             continue
         except Exception as e:
             print(f"[{name}] scrape error: {type(e).__name__}: {e}")
