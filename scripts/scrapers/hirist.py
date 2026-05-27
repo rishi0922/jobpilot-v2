@@ -11,6 +11,7 @@ This rewrite:
   - Walks card selectors then falls back to anchor scraping.
 """
 
+import asyncio
 from datetime import datetime
 from urllib.parse import quote
 
@@ -52,9 +53,13 @@ async def scrape_hirist(queries: list[str], _credentials: dict) -> list[dict]:
 
         for query in queries:
             try:
-                found = await _scrape_one_query(page, query)
+                found = await asyncio.wait_for(
+                    _scrape_one_query(page, query), timeout=60
+                )
                 jobs.extend(found)
                 print(f"[hirist] '{query}' → {len(found)} jobs")
+            except asyncio.TimeoutError:
+                print(f"[hirist] '{query}' timed out after 60s")
             except Exception as e:
                 print(f"[hirist] '{query}': {type(e).__name__}: {e}")
 

@@ -17,12 +17,14 @@ Instahyre's `/api/v1/jobs/` endpoint is gated behind a session cookie, so we
 don't hit the API directly — the HTML path with proper waits is good enough.
 """
 
+import asyncio
 from datetime import datetime
 from urllib.parse import quote
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 from ._common import (
+    _safe_login,
     build_rich_description,
     collect_tag_texts,
     new_stealth_context,
@@ -55,29 +57,21 @@ async def scrape_instahyre(queries: list[str], credentials: dict) -> list[dict]:
         page = await context.new_page()
 
         if credentials.get("username") and credentials.get("password"):
-            try:
-                await page.goto(f"{BASE}/login/", wait_until="domcontentloaded", timeout=20000)
-                await page.wait_for_timeout(1500)
-                for sel in ['input[name="email"]', 'input[type="email"]', "#email"]:
-                    el = await page.query_selector(sel)
-                    if el:
-                        await el.fill(credentials["username"])
-                        break
-                for sel in ['input[name="password"]', 'input[type="password"]', "#password"]:
-                    el = await page.query_selector(sel)
-                    if el:
-                        await el.fill(credentials["password"])
-                        break
-                await page.click('button[type="submit"]')
-                await page.wait_for_timeout(3000)
-            except Exception as e:
-                print(f"[instahyre] Login failed: {e}")
+            await _safe_login(page, credentials, "instahyre", f"{BASE}/login/")
 
         for query in queries:
+            # Per-query hard timeout. Each query has its own multi-URL retry
+            # inside `_scrape_one_query`, but if Instahyre's networkidle
+            # never fires (long-polling XHRs) the whole scraper hangs
+            # forever. 60s is enough for the 3 URL shapes × 25s gotos.
             try:
-                found = await _scrape_one_query(page, query)
+                found = await asyncio.wait_for(
+                    _scrape_one_query(page, query), timeout=60
+                )
                 jobs.extend(found)
                 print(f"[instahyre] '{query}' → {len(found)} jobs")
+            except asyncio.TimeoutError:
+                print(f"[instahyre] '{query}' timed out after 60s")
             except Exception as e:
                 print(f"[instahyre] '{query}': {type(e).__name__}: {e}")
 

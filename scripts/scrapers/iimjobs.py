@@ -14,6 +14,7 @@ have been rotated since that scraper was written. This rewrite:
     if no card matched any selector, so we still get *something* back.
 """
 
+import asyncio
 import re
 from datetime import datetime
 from urllib.parse import quote
@@ -21,6 +22,7 @@ from urllib.parse import quote
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 from ._common import (
+    _safe_login,
     build_rich_description,
     collect_tag_texts,
     new_stealth_context,
@@ -84,30 +86,19 @@ async def scrape_iimjobs(queries: list[str], credentials: dict) -> list[dict]:
         page = await context.new_page()
 
         if credentials.get("username") and credentials.get("password"):
-            try:
-                await page.goto(f"{BASE}/candidate/login", wait_until="domcontentloaded", timeout=20000)
-                await page.wait_for_timeout(1500)
-                # Multiple selector candidates for the email/password fields
-                for sel in ['input[name="email"]', 'input[type="email"]', "#email"]:
-                    el = await page.query_selector(sel)
-                    if el:
-                        await el.fill(credentials["username"])
-                        break
-                for sel in ['input[name="password"]', 'input[type="password"]', "#password"]:
-                    el = await page.query_selector(sel)
-                    if el:
-                        await el.fill(credentials["password"])
-                        break
-                await page.click('button[type="submit"]')
-                await page.wait_for_timeout(3000)
-            except Exception as e:
-                print(f"[iimjobs] Login failed: {e}")
+            await _safe_login(page, credentials, "iimjobs", f"{BASE}/candidate/login")
 
         for query in queries:
+            # Per-query timeout — bounds each query to 60s so a single hung
+            # search doesn't burn the source's 4-minute outer budget.
             try:
-                found_for_query = await _scrape_one_query(page, query)
+                found_for_query = await asyncio.wait_for(
+                    _scrape_one_query(page, query), timeout=60
+                )
                 jobs.extend(found_for_query)
                 print(f"[iimjobs] '{query}' → {len(found_for_query)} jobs")
+            except asyncio.TimeoutError:
+                print(f"[iimjobs] '{query}' timed out after 60s")
             except Exception as e:
                 print(f"[iimjobs] '{query}': {type(e).__name__}: {e}")
 

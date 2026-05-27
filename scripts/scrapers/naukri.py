@@ -32,6 +32,7 @@ Pagination quirk we handle: `/.../india-0` 301s to `/.../india` (no suffix),
 but `/.../india-20`, `/.../india-40` resolve directly. We never request `-0`.
 """
 
+import asyncio
 from datetime import datetime
 from typing import Optional
 from urllib.parse import quote
@@ -39,6 +40,7 @@ from urllib.parse import quote
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 from ._common import (
+    _safe_login,
     build_rich_description,
     collect_tag_texts,
     new_stealth_context,
@@ -84,96 +86,22 @@ async def scrape_naukri(queries: list[str], credentials: dict) -> list[dict]:
             print(f"[naukri] homepage warm-up failed: {type(e).__name__}: {e}")
 
         if credentials.get("username") and credentials.get("password"):
-            await _login(page, credentials)
+            await _safe_login(page, credentials, "naukri", f"{BASE_URL}/nlogin/login")
 
         for query in queries:
             kept_for_query = 0
 
-            # ── Per-query pagination ────────────────────────────────────
-            for page_idx in range(HTML_PAGES_PER_QUERY):
-                offset = page_idx * HTML_RESULTS_PER_PAGE
-                url = _seo_url(query, offset)
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                except PlaywrightTimeout:
-                    print(f"[naukri] timeout loading {url}")
-                    break
-                except Exception as e:
-                    print(f"[naukri] error loading {url}: {type(e).__name__}: {e}")
-                    break
-
-                # Wait for either the JSON XHR to settle OR the cards to render.
-                try:
-                    await page.wait_for_selector(
-                        "div.srp-jobtuple-wrapper, article.jobTuple",
-                        timeout=12000,
-                    )
-                except PlaywrightTimeout:
-                    # Cards didn't appear. Could be that the JSON path responded
-                    # but the renderer hasn't drawn yet. We still try the
-                    # in-browser API fetch below before giving up.
-                    pass
-
-                # ── Path A: in-browser JSON fetch ───────────────────────
-                # Run from inside the page so the request carries the
-                # cookies Naukri set during the page load. This is what
-                # bypasses the recaptcha-required 406 the direct httpx
-                # call gets.
-                api_rows = await _fetch_via_page(page, query, page_idx + 1)
-                added_from_api = 0
-                for row in api_rows:
-                    src = row.get("sourceUrl")
-                    if not src or src in seen:
-                        continue
-                    seen.add(src)
-                    jobs.append(row)
-                    added_from_api += 1
-
-                # ── Path B: rendered-DOM fallback for this page ─────────
-                added_from_dom = 0
-                if added_from_api == 0:
-                    dom_rows = await _scrape_rendered_cards(page)
-                    for row in dom_rows:
-                        src = row.get("sourceUrl")
-                        if not src or src in seen:
-                            continue
-                        seen.add(src)
-                        jobs.append(row)
-                        added_from_dom += 1
-
-                # ── Path C: inline-JSON fallback ─────────────────────────
-                # If neither the in-page API nor the DOM cards yielded
-                # anything, scan the page's <script> tags for an embedded
-                # JSON blob with jobDetails. Naukri's SSR sometimes hydrates
-                # results into a window-level variable that's there even
-                # when the visible DOM hasn't drawn yet.
-                added_from_inline = 0
-                if added_from_api == 0 and added_from_dom == 0:
-                    inline_rows = await _fetch_inline_json(page)
-                    for row in inline_rows:
-                        src = row.get("sourceUrl")
-                        if not src or src in seen:
-                            continue
-                        seen.add(src)
-                        jobs.append(row)
-                        added_from_inline += 1
-
-                added_this_page = added_from_api + added_from_dom + added_from_inline
-                kept_for_query += added_this_page
-                tag = (
-                    "api"    if added_from_api    else
-                    "dom"    if added_from_dom    else
-                    "inline" if added_from_inline else
-                    "empty"
+            # Per-query timeout. Naukri can hang on any one of: homepage
+            # warm-up redirect, page goto, in-browser fetch, or networkidle.
+            # 90s budget covers 3 pages × ~25s each even on a slow run.
+            try:
+                kept_for_query = await asyncio.wait_for(
+                    _scrape_query_pages(page, query, jobs, seen),
+                    timeout=90,
                 )
-                print(
-                    f"[naukri] '{query}' page={page_idx+1} offset={offset} "
-                    f"+{added_this_page} ({tag})"
-                )
-
-                # If a page returned nothing, further pages probably will too.
-                if added_this_page == 0:
-                    break
+            except asyncio.TimeoutError:
+                print(f"[naukri] '{query}' timed out after 90s")
+                kept_for_query = 0
 
             print(f"[naukri] '{query}' → {kept_for_query} jobs across "
                   f"{HTML_PAGES_PER_QUERY} pages")
@@ -182,6 +110,90 @@ async def scrape_naukri(queries: list[str], credentials: dict) -> list[dict]:
         await browser.close()
 
     return jobs
+
+
+async def _scrape_query_pages(page, query: str, jobs: list[dict], seen: set[str]) -> int:
+    """Walk the per-query pagination and append new rows to `jobs`. Returns
+    how many rows we kept for this query. Extracted out so the caller can
+    wrap it in asyncio.wait_for without losing partial progress."""
+    kept_for_query = 0
+    for page_idx in range(HTML_PAGES_PER_QUERY):
+        offset = page_idx * HTML_RESULTS_PER_PAGE
+        url = _seo_url(query, offset)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        except PlaywrightTimeout:
+            print(f"[naukri] timeout loading {url}")
+            break
+        except Exception as e:
+            print(f"[naukri] error loading {url}: {type(e).__name__}: {e}")
+            break
+
+        # Wait for either the JSON XHR to settle OR the cards to render.
+        try:
+            await page.wait_for_selector(
+                "div.srp-jobtuple-wrapper, article.jobTuple",
+                timeout=12000,
+            )
+        except PlaywrightTimeout:
+            # Cards didn't appear. Could be that the JSON path responded
+            # but the renderer hasn't drawn yet. We still try the in-browser
+            # API fetch below before giving up.
+            pass
+
+        # ── Path A: in-browser JSON fetch ───────────────────────
+        api_rows = await _fetch_via_page(page, query, page_idx + 1)
+        added_from_api = 0
+        for row in api_rows:
+            src = row.get("sourceUrl")
+            if not src or src in seen:
+                continue
+            seen.add(src)
+            jobs.append(row)
+            added_from_api += 1
+
+        # ── Path B: rendered-DOM fallback ───────────────────────
+        added_from_dom = 0
+        if added_from_api == 0:
+            dom_rows = await _scrape_rendered_cards(page)
+            for row in dom_rows:
+                src = row.get("sourceUrl")
+                if not src or src in seen:
+                    continue
+                seen.add(src)
+                jobs.append(row)
+                added_from_dom += 1
+
+        # ── Path C: inline-script JSON fallback ─────────────────
+        added_from_inline = 0
+        if added_from_api == 0 and added_from_dom == 0:
+            inline_rows = await _fetch_inline_json(page)
+            for row in inline_rows:
+                src = row.get("sourceUrl")
+                if not src or src in seen:
+                    continue
+                seen.add(src)
+                jobs.append(row)
+                added_from_inline += 1
+
+        added_this_page = added_from_api + added_from_dom + added_from_inline
+        kept_for_query += added_this_page
+        tag = (
+            "api"    if added_from_api    else
+            "dom"    if added_from_dom    else
+            "inline" if added_from_inline else
+            "empty"
+        )
+        print(
+            f"[naukri] '{query}' page={page_idx+1} offset={offset} "
+            f"+{added_this_page} ({tag})"
+        )
+
+        # If a page returned nothing, further pages probably will too.
+        if added_this_page == 0:
+            break
+
+    return kept_for_query
 
 
 def _seo_url(query: str, offset: int) -> str:
@@ -463,32 +475,4 @@ async def _parse_card(card) -> Optional[dict]:
         return None
 
 
-# ── Login ───────────────────────────────────────────────────────────────────
-
-async def _login(page, creds: dict):
-    try:
-        await page.goto(f"{BASE_URL}/nlogin/login", wait_until="domcontentloaded", timeout=20000)
-        await page.wait_for_timeout(1500)
-        for sel in [
-            'input[placeholder*="Enter your active Email ID"]',
-            'input[placeholder*="Email"]',
-            'input[type="email"]',
-            "#usernameField",
-        ]:
-            el = await page.query_selector(sel)
-            if el:
-                await el.fill(creds["username"])
-                break
-        for sel in [
-            'input[placeholder*="Enter your password"]',
-            'input[type="password"]',
-            "#passwordField",
-        ]:
-            el = await page.query_selector(sel)
-            if el:
-                await el.fill(creds["password"])
-                break
-        await page.click('button[type="submit"]')
-        await page.wait_for_timeout(3000)
-    except Exception as e:
-        print(f"[naukri] Login failed: {e}")
+# ── Login: handled by shared `_safe_login` in scrapers._common ──────────────

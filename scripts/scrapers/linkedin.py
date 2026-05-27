@@ -23,37 +23,20 @@ async def scrape_linkedin(queries: list[str], credentials: dict) -> list[dict]:
         )
         page = await context.new_page()
 
-        # Login for Easy Apply access
+        # Login for Easy Apply access (best-effort; public listings work without it)
         if credentials.get("username") and credentials.get("password"):
-            await _login(page, credentials)
+            from ._common import _safe_login
+            await _safe_login(page, credentials, "linkedin", f"{BASE_URL}/login")
 
         for query in queries:
+            # Per-query 60s timeout — bounds any single query so a hung page
+            # doesn't burn the source's outer 4-minute budget.
             try:
-                params = urlencode({
-                    "keywords": query,
-                    "location": "India",
-                    "geoId":    LOCATION_GEO_ID,
-                    "f_TPR":    "r604800",   # past week
-                    "f_E":      "1,2",       # entry to mid level
-                    "start":    "0",
-                })
-                url = f"{BASE_URL}/jobs/search/?{params}"
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(2500)
-
-                # Scroll to load more
-                for _ in range(3):
-                    await page.evaluate("window.scrollBy(0, 800)")
-                    await page.wait_for_timeout(800)
-
-                cards = await page.query_selector_all(".jobs-search__results-list li, .job-card-container")
-                for card in cards[:20]:
-                    try:
-                        job = await _parse_card(card)
-                        if job:
-                            jobs.append(job)
-                    except Exception:
-                        continue
+                await asyncio.wait_for(
+                    _scrape_linkedin_query(page, query, jobs), timeout=60
+                )
+            except asyncio.TimeoutError:
+                print(f"[linkedin] '{query}' timed out after 60s")
             except PlaywrightTimeout:
                 print(f"[linkedin] Timeout for: {query}")
             except Exception as e:
@@ -64,16 +47,35 @@ async def scrape_linkedin(queries: list[str], credentials: dict) -> list[dict]:
     seen = set()
     return [j for j in jobs if not (j["sourceUrl"] in seen or seen.add(j["sourceUrl"]))]
 
-async def _login(page, creds: dict):
-    try:
-        await page.goto(f"{BASE_URL}/login", wait_until="domcontentloaded", timeout=20000)
-        await page.wait_for_timeout(1500)
-        await page.fill("#username", creds["username"])
-        await page.fill("#password", creds["password"])
-        await page.click('button[type="submit"]')
-        await page.wait_for_timeout(4000)
-    except Exception as e:
-        print(f"[linkedin] Login failed: {e}")
+async def _scrape_linkedin_query(page, query: str, jobs: list[dict]):
+    """Scrape one keyword across the LinkedIn India jobs page. Appends rows
+    onto the shared `jobs` list. Extracted so we can wrap it in
+    asyncio.wait_for at the caller."""
+    params = urlencode({
+        "keywords": query,
+        "location": "India",
+        "geoId":    LOCATION_GEO_ID,
+        "f_TPR":    "r604800",   # past week
+        "f_E":      "1,2",       # entry to mid level
+        "start":    "0",
+    })
+    url = f"{BASE_URL}/jobs/search/?{params}"
+    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    await page.wait_for_timeout(2500)
+
+    # Scroll to load more
+    for _ in range(3):
+        await page.evaluate("window.scrollBy(0, 800)")
+        await page.wait_for_timeout(800)
+
+    cards = await page.query_selector_all(".jobs-search__results-list li, .job-card-container")
+    for card in cards[:20]:
+        try:
+            job = await _parse_card(card)
+            if job:
+                jobs.append(job)
+        except Exception:
+            continue
 
 async def _parse_card(card) -> dict | None:
     try:

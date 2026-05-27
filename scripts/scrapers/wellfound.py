@@ -16,6 +16,7 @@ This rewrite:
   - Multi-selector card extraction with anchor fallback.
 """
 
+import asyncio
 from datetime import datetime
 from urllib.parse import quote
 
@@ -57,9 +58,13 @@ async def scrape_wellfound(queries: list[str], _credentials: dict) -> list[dict]
 
         for query in queries:
             try:
-                found = await _scrape_one_query(page, query)
+                found = await asyncio.wait_for(
+                    _scrape_one_query(page, query), timeout=60
+                )
                 jobs.extend(found)
                 print(f"[wellfound] '{query}' → {len(found)} jobs")
+            except asyncio.TimeoutError:
+                print(f"[wellfound] '{query}' timed out after 60s")
             except Exception as e:
                 print(f"[wellfound] '{query}': {type(e).__name__}: {e}")
 

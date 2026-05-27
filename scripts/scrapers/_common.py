@@ -192,6 +192,72 @@ async def collect_tag_texts(card, root_selector: str, item_selector: str = "li")
         return ""
 
 
+async def _safe_login(page, creds: dict, source: str, login_url: str):
+    """Best-effort login that fails fast (≤5s per element instead of the
+    default 30s). All target sites have rotated their login forms in the
+    last year and our credential flow breaks more often than it works —
+    but the public listing pages still scrape fine without auth, so a
+    failed login should NOT waste 30+ seconds of the run budget.
+
+    Returns nothing; logs success/failure. If any element is missing or
+    the click times out, we silently continue — the caller will fall
+    back to the unauthenticated scrape path."""
+    try:
+        await page.goto(login_url, wait_until="domcontentloaded", timeout=15000)
+        await page.wait_for_timeout(800)
+
+        # Try email/username field
+        filled_user = False
+        for sel in [
+            'input[name="email"]', 'input[type="email"]', "#email",
+            'input[name="username"]', "#username", "#usernameField",
+            'input[placeholder*="Email" i]', 'input[placeholder*="Enter your"]',
+        ]:
+            try:
+                await page.fill(sel, creds["username"], timeout=2500)
+                filled_user = True
+                break
+            except Exception:
+                continue
+        if not filled_user:
+            print(f"[{source}] login: no username field found — skipping")
+            return
+
+        # Try password field
+        filled_pwd = False
+        for sel in [
+            'input[name="password"]', 'input[type="password"]',
+            "#password", "#passwordField",
+        ]:
+            try:
+                await page.fill(sel, creds["password"], timeout=2500)
+                filled_pwd = True
+                break
+            except Exception:
+                continue
+        if not filled_pwd:
+            print(f"[{source}] login: no password field found — skipping")
+            return
+
+        # Submit. Try a few common shapes; if none work in 5s total, give up.
+        for sel in [
+            'button[type="submit"]',
+            'button:has-text("Login")',
+            'button:has-text("Sign in")',
+            'input[type="submit"]',
+        ]:
+            try:
+                await page.click(sel, timeout=2500)
+                await page.wait_for_timeout(2000)
+                print(f"[{source}] login: submitted")
+                return
+            except Exception:
+                continue
+        print(f"[{source}] login: no submit button found — skipping")
+    except Exception as e:
+        print(f"[{source}] login: {type(e).__name__}: {e}")
+
+
 def looks_like_target_role(title: str) -> bool:
     """Pre-filter used by generic fallback paths. The orchestrator
     (`main.py::classify_role`) does the authoritative filtering, so this is
