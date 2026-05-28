@@ -122,6 +122,30 @@ async def get_credentials(site: str) -> dict:
         print(f"[creds] {site}: {type(e).__name__}: {e}")
         return {}
 
+async def _keepalive_loop():
+    """Render's free-tier web service spins down after 15 minutes of no
+    incoming HTTP traffic — even if Python is actively running in the
+    background. A full scrape takes ~25-30 minutes, well past that
+    threshold, so without this we get killed mid-IIMJobs every time.
+
+    Workaround: from inside the scrape, hit our own /health endpoint every
+    60 s. Render counts that as activity and keeps the service alive.
+
+    Cancelled by `_run_full_scrape` once the scrape finishes. Any errors
+    are swallowed — if the keepalive itself crashes the scrape should
+    still proceed (just risks the 15-min sleep again)."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    await client.get("http://localhost:10000/health")
+                except Exception:
+                    pass  # don't surface — keepalive failures are best-effort
+    except asyncio.CancelledError:
+        pass  # normal shutdown when scrape completes
+
+
 async def fetch_known_urls() -> set[str]:
     """Pull the set of sourceUrls already stored in the DB so we can skip them
     before doing the expensive parse/score/upsert work. Returns an empty set
@@ -188,6 +212,10 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
     We also flush jobs to the ingest endpoint after every site, so partial
     progress is preserved even if a later scraper crashes the container.
     """
+    # Spawn the self-keepalive task so Render's 15-min idle timer never fires
+    # while a scrape is in progress. Cancelled at the end of this function.
+    keepalive_task = asyncio.create_task(_keepalive_loop())
+
     # Seed the in-memory dedup set with URLs already in the DB. Cards whose URL
     # is in this set will be dropped before we run quality-gate / scoring /
     # upsert — saving the wasted work of re-processing the same job every run.
@@ -318,6 +346,13 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
     # Final ping ensures the run is marked complete in the DB even if 0 jobs
     if total_saved == 0:
         await save_jobs([], run_id)
+
+    # Cancel the keepalive — scrape is done, Render can sleep now.
+    keepalive_task.cancel()
+    try:
+        await keepalive_task
+    except (asyncio.CancelledError, Exception):
+        pass
 
     print(f"[scrape] {run_id} complete — {total_saved} jobs from {len(enabled)} sources")
 
