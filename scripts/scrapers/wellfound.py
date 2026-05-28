@@ -36,13 +36,15 @@ BASE = "https://wellfound.com"
 
 
 def _search_urls(query: str) -> list[str]:
+    """Wellfound is heavily bot-walled — historically returns 0 jobs from a
+    headless Playwright session regardless of URL shape. We try only 2 URLs
+    (instead of the previous 4) so a failing query costs ~30s instead of
+    ~120s, freeing budget for MNC at the end of the run."""
     q = quote(query)
     slug = query.replace(" ", "-").lower()
     return [
         f"{BASE}/jobs?q={q}&country=IN",
         f"{BASE}/role/l/{slug}/india",
-        f"{BASE}/role/{slug}",
-        f"{BASE}/jobs?role={slug}&location=india",
     ]
 
 
@@ -57,15 +59,17 @@ async def scrape_wellfound(queries: list[str], _credentials: dict) -> list[dict]
         page = await context.new_page()
 
         for query in queries:
-            # 120s per query covers Wellfound's 4-URL retry × ~30s goto each.
+            # 45s per query — with 2-URL retry × ~20s each (15s goto + 3s
+            # networkidle + 1.5s scroll), this is enough to fall through
+            # cleanly when Wellfound's bot wall hides the listings.
             try:
                 found = await asyncio.wait_for(
-                    _scrape_one_query(page, query), timeout=120
+                    _scrape_one_query(page, query), timeout=45
                 )
                 jobs.extend(found)
                 print(f"[wellfound] '{query}' → {len(found)} jobs")
             except asyncio.TimeoutError:
-                print(f"[wellfound] '{query}' timed out after 120s")
+                print(f"[wellfound] '{query}' timed out after 45s")
             except Exception as e:
                 print(f"[wellfound] '{query}': {type(e).__name__}: {e}")
 
@@ -77,16 +81,20 @@ async def scrape_wellfound(queries: list[str], _credentials: dict) -> list[dict]
 async def _scrape_one_query(page, query: str) -> list[dict]:
     for url in _search_urls(query):
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            # Shorter networkidle wait — Wellfound's analytics polling never lets
+            # networkidle fire, so this just always burns the full timeout. 3s
+            # is enough for the initial XHR batch and saves 7s per URL.
             try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
+                await page.wait_for_load_state("networkidle", timeout=3000)
             except PlaywrightTimeout:
                 pass
 
-            # Trigger any lazy-loaded cards
-            for _ in range(4):
+            # Trigger lazy-loaded cards. Two scrolls is enough for the visible
+            # viewport — the full results list is gated behind login anyway.
+            for _ in range(2):
                 await page.evaluate("window.scrollBy(0, 700)")
-                await page.wait_for_timeout(700)
+                await page.wait_for_timeout(500)
 
             found = await _extract_cards(page)
             if found:

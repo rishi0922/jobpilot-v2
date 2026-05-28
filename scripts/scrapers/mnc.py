@@ -25,6 +25,7 @@ The list of companies and their preferred path is the only thing maintenance
 should ever need to touch.
 """
 
+import asyncio
 import re
 from datetime import datetime
 from typing import Optional
@@ -357,16 +358,16 @@ def _ms_iso(ms: object) -> Optional[str]:
 async def _scrape_html_company(page, cfg: dict) -> list[dict]:
     out: list[dict] = []
     try:
-        await page.goto(cfg["search_url"], wait_until="domcontentloaded", timeout=30000)
+        await page.goto(cfg["search_url"], wait_until="domcontentloaded", timeout=20000)
         try:
-            await page.wait_for_load_state("networkidle", timeout=10000)
+            await page.wait_for_load_state("networkidle", timeout=4000)
         except PlaywrightTimeout:
             pass
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(800)
 
-        for _ in range(3):
+        for _ in range(2):
             await page.evaluate("window.scrollBy(0, 700)")
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(400)
 
         # Try a generic list of card containers before falling back to anchors
         card_selectors = [
@@ -439,12 +440,23 @@ async def _scrape_html_company(page, cfg: dict) -> list[dict]:
 
 async def scrape_mnc_sites() -> list[dict]:
     """Run API-path companies first (fast, reliable), then HTML-path
-    companies (slow, browser-based)."""
+    companies (slow, browser-based).
+
+    The API path is now parallelised — 22 sequential HTTPS calls @ 15 s
+    timeout each can burn 5+ minutes when one company has a hung CDN. With
+    asyncio.gather() they all run concurrently and the slowest one is the
+    only bound, dropping the API path from ~5 min worst-case to ~15 s.
+
+    The HTML path stays sequential (running 15 Chromium tabs concurrently
+    would OOM the 512 MB Render container) but each company now has its
+    own 30 s wait_for cap so a single broken Workday/Taleo site can't eat
+    the entire run budget.
+    """
     out: list[dict] = []
 
-    # ── API path ──
+    # ── API path: run all companies concurrently ──
     async with httpx.AsyncClient(headers=API_HEADERS) as client:
-        for name, vendor, slug in API_COMPANIES:
+        async def _one(name: str, vendor: str, slug: str):
             if vendor == "greenhouse":
                 jobs = await _fetch_greenhouse(client, name, slug)
             elif vendor == "lever":
@@ -455,9 +467,19 @@ async def scrape_mnc_sites() -> list[dict]:
                 jobs = []
             if jobs:
                 print(f"[mnc:{vendor}:{name}] {len(jobs)} jobs")
-            out.extend(jobs)
+            return jobs
 
-    # ── HTML path ──
+        results = await asyncio.gather(
+            *[_one(name, vendor, slug) for name, vendor, slug in API_COMPANIES],
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, list):
+                out.extend(r)
+            else:
+                print(f"[mnc:api] task error: {type(r).__name__}: {r}")
+
+    # ── HTML path: sequential with per-company timeout ──
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -467,12 +489,21 @@ async def scrape_mnc_sites() -> list[dict]:
             context = await new_stealth_context(browser)
             page = await context.new_page()
             try:
-                jobs = await _scrape_html_company(page, cfg)
+                jobs = await asyncio.wait_for(
+                    _scrape_html_company(page, cfg), timeout=30
+                )
                 if jobs:
                     print(f"[mnc:html:{cfg['company']}] {len(jobs)} jobs")
                 out.extend(jobs)
+            except asyncio.TimeoutError:
+                print(f"[mnc:html:{cfg['company']}] timed out after 30s")
+            except Exception as e:
+                print(f"[mnc:html:{cfg['company']}] {type(e).__name__}: {e}")
             finally:
-                await context.close()
+                try:
+                    await context.close()
+                except Exception:
+                    pass
         await browser.close()
 
     return out

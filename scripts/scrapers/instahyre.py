@@ -60,16 +60,18 @@ async def scrape_instahyre(queries: list[str], credentials: dict) -> list[dict]:
             await _safe_login(page, credentials, "instahyre", f"{BASE}/login/")
 
         for query in queries:
-            # 120s per query covers Instahyre's 3-URL retry × ~25s goto each
-            # plus the networkidle long-polling timeout.
+            # 45s per query — Instahyre's search consistently returns 0 from
+            # public (non-logged-in) scraping because their listings are
+            # gated behind auth. Bounded short so we don't burn budget on a
+            # source that historically produces nothing.
             try:
                 found = await asyncio.wait_for(
-                    _scrape_one_query(page, query), timeout=120
+                    _scrape_one_query(page, query), timeout=45
                 )
                 jobs.extend(found)
                 print(f"[instahyre] '{query}' → {len(found)} jobs")
             except asyncio.TimeoutError:
-                print(f"[instahyre] '{query}' timed out after 120s")
+                print(f"[instahyre] '{query}' timed out after 45s")
             except Exception as e:
                 print(f"[instahyre] '{query}': {type(e).__name__}: {e}")
 
