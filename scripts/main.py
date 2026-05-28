@@ -330,8 +330,25 @@ async def run_scrape(payload: ScrapeRequest, background: BackgroundTasks):
     This pattern is required because the caller (Vercel serverless) cannot wait
     for a multi-minute scrape to complete.
     """
+    # Order matters on Render's 512 MB free tier — Chromium leaks ~150 MB per
+    # browser launch even after `await browser.close()` (the OS doesn't fully
+    # reclaim mapped pages until the process exits). Running 7 Playwright
+    # scrapers in sequence eventually OOMs the container mid-run.
+    #
+    # Mitigations:
+    #   1. HTTP-only sources (ats, mnc-API path) run FIRST so we always capture
+    #      their jobs before any OOM risk.
+    #   2. Highest-yield Playwright sources (hirist, iimjobs) come next so if
+    #      we crash later, the most valuable jobs are already saved.
+    #   3. Low-yield/broken sources (naukri, instahyre, wellfound) go LAST so
+    #      an OOM there costs us the least.
+    #
+    # Naukri is excluded from defaults entirely because it now consistently
+    # returns 0 jobs (server-side bot wall + API 404) and burns a Chromium
+    # launch that we can't afford. Callers can still pass sources=['naukri']
+    # explicitly if they want to retry.
     enabled = payload.sources or [
-        "ats", "naukri", "linkedin", "iimjobs", "instahyre", "hirist", "wellfound", "mnc"
+        "ats", "mnc", "hirist", "iimjobs", "linkedin", "wellfound", "instahyre"
     ]
     run_id = payload.runId or f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 

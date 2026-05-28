@@ -40,6 +40,7 @@ from urllib.parse import quote
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 from ._common import (
+    LOW_MEM_CHROMIUM_ARGS,
     _safe_login,
     build_rich_description,
     collect_tag_texts,
@@ -66,10 +67,7 @@ async def scrape_naukri(queries: list[str], credentials: dict) -> list[dict]:
     seen: set[str] = set()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
+        browser = await p.chromium.launch(headless=True, args=LOW_MEM_CHROMIUM_ARGS)
         context = await new_stealth_context(browser)
         page = await context.new_page()
 

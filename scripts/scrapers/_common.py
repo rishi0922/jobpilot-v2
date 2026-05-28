@@ -54,6 +54,28 @@ window.chrome = { runtime: {} };
 """
 
 
+# Chromium launch flags tuned for Render's 512 MB free-tier container. The
+# default Playwright Chromium launches a multi-process model that maps shared
+# memory into /dev/shm (which Render gives only 64 MB of), and keeps a GPU
+# process even in headless mode. These flags drop steady-state memory by
+# ~100-150 MB per scraper, which is the difference between completing all 7
+# sources and OOM-killing mid-run.
+LOW_MEM_CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-dev-shm-usage",          # use /tmp instead of the 64 MB /dev/shm
+    "--disable-gpu",                    # no GPU process needed in headless
+    "--disable-software-rasterizer",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-renderer-backgrounding",
+    "--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins,site-per-process",
+    "--no-zygote",                      # disable the zygote process (saves ~30 MB)
+    "--single-process",                 # one process for all renderers (huge savings, less stable)
+]
+
+
 async def new_stealth_context(browser, *, locale: str = "en-IN"):
     """Create a Playwright browser context that looks like real Chrome and
     blocks the obvious headless detection vectors. Call this from each scraper

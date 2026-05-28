@@ -34,6 +34,7 @@ import httpx
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 from ._common import (
+    LOW_MEM_CHROMIUM_ARGS,
     REAL_BROWSER_HEADERS,
     REAL_UA,
     new_stealth_context,
@@ -481,10 +482,7 @@ async def scrape_mnc_sites() -> list[dict]:
 
     # ── HTML path: sequential with per-company timeout ──
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
+        browser = await p.chromium.launch(headless=True, args=LOW_MEM_CHROMIUM_ARGS)
         for cfg in HTML_COMPANIES:
             context = await new_stealth_context(browser)
             page = await context.new_page()

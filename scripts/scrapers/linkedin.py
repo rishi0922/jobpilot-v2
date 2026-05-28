@@ -14,9 +14,10 @@ BASE_URL = "https://www.linkedin.com"
 LOCATION_GEO_ID = "102713980"  # India
 
 async def scrape_linkedin(queries: list[str], credentials: dict) -> list[dict]:
+    from ._common import LOW_MEM_CHROMIUM_ARGS
     jobs = []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = await p.chromium.launch(headless=True, args=LOW_MEM_CHROMIUM_ARGS)
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
             locale="en-IN",
