@@ -55,11 +55,16 @@ window.chrome = { runtime: {} };
 
 
 # Chromium launch flags tuned for Render's 512 MB free-tier container. The
-# default Playwright Chromium launches a multi-process model that maps shared
-# memory into /dev/shm (which Render gives only 64 MB of), and keeps a GPU
-# process even in headless mode. These flags drop steady-state memory by
-# ~100-150 MB per scraper, which is the difference between completing all 7
-# sources and OOM-killing mid-run.
+# default Playwright Chromium maps shared memory into /dev/shm (which Render
+# gives only 64 MB of) and keeps a GPU process even in headless mode. These
+# flags drop steady-state memory by ~70-100 MB per scraper, which buys enough
+# headroom to complete the full source rotation without OOM-killing.
+#
+# We deliberately do NOT use --single-process or --no-zygote: those flags save
+# another ~150 MB but collapse every renderer into one process, so any single
+# crash (e.g. a DNS failure on one company's careers page) takes down the
+# entire browser and throws TargetClosedError on the next page.new_page() call.
+# We tried that — TCS's ibegin.tcs.com NXDOMAIN aborted the rest of MNC.
 LOW_MEM_CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-blink-features=AutomationControlled",
@@ -71,8 +76,6 @@ LOW_MEM_CHROMIUM_ARGS = [
     "--disable-background-timer-throttling",
     "--disable-renderer-backgrounding",
     "--disable-features=TranslateUI,BlinkGenPropertyTrees,IsolateOrigins,site-per-process",
-    "--no-zygote",                      # disable the zygote process (saves ~30 MB)
-    "--single-process",                 # one process for all renderers (huge savings, less stable)
 ]
 
 
