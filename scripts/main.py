@@ -219,7 +219,17 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
     # Seed the in-memory dedup set with URLs already in the DB. Cards whose URL
     # is in this set will be dropped before we run quality-gate / scoring /
     # upsert — saving the wasted work of re-processing the same job every run.
-    seen_urls: set[str] = await fetch_known_urls()
+    db_known_urls: set[str] = await fetch_known_urls()
+    seen_urls: set[str] = set(db_known_urls)
+
+    # Track every DB-known URL we encounter during this run so we can bump
+    # their `lastUpdated` afterwards via /api/scraper/touch-seen. Without
+    # this, the 7-day cleanup in /api/scraper/trigger would incorrectly
+    # delete jobs that are still being re-found on every run (since the
+    # dedup short-circuits them before /ingest, where lastUpdated is
+    # normally bumped via upsert).
+    refound_urls: set[str] = set()
+
     total_saved = 0
 
     # Map source name -> a zero-arg async callable that returns its job list.
@@ -304,6 +314,11 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
                 continue
             if url in seen_urls:
                 dropped_known += 1
+                # If this URL came from the DB-known seed (not a within-run
+                # duplicate), record it so we can bump its lastUpdated after
+                # the run finishes — keeping it safe from the 7-day cleanup.
+                if url in db_known_urls:
+                    refound_urls.add(url)
                 continue
             seen_urls.add(url)
 
@@ -346,6 +361,25 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
     # Final ping ensures the run is marked complete in the DB even if 0 jobs
     if total_saved == 0:
         await save_jobs([], run_id)
+
+    # Bump lastUpdated on every DB-known URL we re-found this run, so the
+    # 7-day cleanup doesn't sweep them away. Sent in one batch — the
+    # endpoint runs a single SQL `UPDATE … WHERE sourceUrl IN (…)`.
+    if refound_urls:
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(
+                    f"{NEXT_APP_URL}/api/scraper/touch-seen",
+                    json={"urls": list(refound_urls)},
+                    headers={"x-api-key": SCRAPER_API_KEY},
+                )
+                if r.status_code == 200:
+                    body = r.json()
+                    print(f"[touch-seen] refreshed lastUpdated on {body.get('touched', 0)} re-found jobs")
+                else:
+                    print(f"[touch-seen] HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[touch-seen] failed: {type(e).__name__}: {e}")
 
     # Cancel the keepalive — scrape is done, Render can sleep now.
     keepalive_task.cancel()

@@ -33,6 +33,28 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'SCRAPER_API_URL not configured' }, { status: 500 })
   }
 
+  // Cleanup: delete any FOUND/QUEUED/SKIPPED job that hasn't been re-found
+  // for 7 days. We use `lastUpdated` (the scraper now bumps it on every
+  // re-find via /api/scraper/touch-seen, even for dedup-dropped URLs), so
+  // jobs that are still being listed on their source stay alive — only
+  // genuinely stale postings get deleted. We never touch jobs the user has
+  // engaged with (APPLIED / IN_REVIEW / INTERVIEW / REJECTED / FAILED).
+  try {
+    const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+    const deleted = await prisma.job.deleteMany({
+      where: {
+        lastUpdated: { lt: cutoff },
+        status: { in: ['FOUND', 'QUEUED', 'SKIPPED'] },
+      },
+    })
+    if (deleted.count > 0) {
+      console.log(`[trigger] cleanup: removed ${deleted.count} stale jobs (>7d, no engagement)`)
+    }
+  } catch (e) {
+    // Cleanup failure should never block a scrape — just log and proceed
+    console.error('[trigger] cleanup failed:', e)
+  }
+
   let runId: string | null = null
   try {
     const run = await prisma.scraperRun.create({
