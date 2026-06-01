@@ -102,6 +102,17 @@ interface JobDetail extends Job {
 
 // ---- Components ----
 
+/**
+ * Glassmorphic stat card. Renders inside the dark gradient hero section
+ * (see <StatBoard/>) and gets its glass effect from:
+ *   - very light translucent base (bg-white/[0.04]) over the dark backdrop
+ *   - backdrop-blur-xl for the frosted-glass softening
+ *   - subtle white border + soft shadow for the floating-card feel
+ *   - a 1px gradient highlight along the top edge that mimics a glass
+ *     reflection (the ::before pseudo-element done as an absolute div)
+ *
+ * Design reference: docs/design-inspiration.md (glass-cards screenshot).
+ */
 function StatCard({ label, value, sub, color, onClick }: { label: string; value: string | number; sub?: string; color?: string; onClick?: () => void }) {
   const clickable = typeof onClick === 'function'
   return (
@@ -109,13 +120,17 @@ function StatCard({ label, value, sub, color, onClick }: { label: string; value:
       onClick={onClick}
       role={clickable ? 'button' : undefined}
       tabIndex={clickable ? 0 : undefined}
-      className={`bg-white rounded-2xl p-4 border border-surface-200 flex flex-col gap-1 animate-slide-up ${
-        clickable ? 'cursor-pointer hover:border-brand-300 hover:shadow-sm transition-all' : ''
+      className={`relative overflow-hidden rounded-2xl bg-white/[0.04] backdrop-blur-xl border border-white/10 p-4 flex flex-col gap-1.5 shadow-lg shadow-black/30 animate-slide-up ${
+        clickable ? 'cursor-pointer hover:bg-white/[0.07] hover:border-white/20 hover:shadow-xl hover:shadow-black/40 transition-all' : ''
       }`}
     >
-      <p className="text-xs text-ink-tertiary font-medium tracking-wide uppercase">{label}</p>
-      <p className={`text-3xl font-semibold ${color || 'text-ink-primary'}`}>{value}</p>
-      {sub && <p className="text-xs text-ink-tertiary">{sub}</p>}
+      {/* Top-edge glass reflection — a thin gradient line that catches light
+          like a real piece of frosted acrylic. Inset slightly so it doesn't
+          reach the rounded corners. */}
+      <div className="absolute inset-x-3 top-0 h-px bg-gradient-to-r from-transparent via-white/25 to-transparent pointer-events-none" />
+      <p className="text-[10px] text-white/50 font-medium tracking-wider uppercase">{label}</p>
+      <p className={`text-3xl font-semibold ${color || 'text-white'}`}>{value}</p>
+      {sub && <p className="text-xs text-white/50">{sub}</p>}
     </div>
   )
 }
@@ -640,26 +655,37 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* Stat cards */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3 mb-6">
-          <StatCard label="Jobs found" value={stats.totalFound.toLocaleString()} sub={loadingData ? 'Loading…' : 'All time'} />
-          <StatCard
-            label="Applied"
-            value={stats.totalApplied.toLocaleString()}
-            sub={stats.totalFound > 0 ? `${Math.round((stats.totalApplied / stats.totalFound) * 100)}% of found` : '—'}
-          />
-          <StatCard label="In review" value={stats.inReview} color="text-amber-500" />
-          <StatCard label="Interviews" value={stats.interviews} color="text-emerald-500" sub={`${stats.successRate}% rate`} />
-          <StatCard
-            label="Failed"
-            value={stats.failed}
-            color="text-red-400"
-            sub={stats.failed > 0 ? 'Click to retry →' : 'All clean'}
-            onClick={stats.failed > 0 ? () => {
-              setActiveTab('jobs')
-              setFilterStatus('FAILED')
-            } : undefined}
-          />
+        {/* Stat cards: glassmorphic widgets on a dark gradient backdrop.
+            The dark surface gives the glass cards something to float over —
+            without it, the bg-white/[0.04] base is invisible. Two large
+            blurred colour blobs in the corners give the surface depth and
+            mimic the ambient lighting in the inspiration screenshot
+            (docs/design-inspiration.md). */}
+        <div className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-slate-900 via-slate-900 to-slate-950 p-5 mb-6 shadow-2xl shadow-slate-950/30">
+          {/* Ambient glow blobs — purely decorative, behind everything */}
+          <div className="absolute -top-32 -right-24 h-72 w-72 rounded-full bg-indigo-500/20 blur-3xl pointer-events-none" />
+          <div className="absolute -bottom-32 -left-24 h-72 w-72 rounded-full bg-emerald-500/10 blur-3xl pointer-events-none" />
+
+          <div className="relative grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
+            <StatCard label="Jobs found" value={stats.totalFound.toLocaleString()} sub={loadingData ? 'Loading…' : 'All time'} />
+            <StatCard
+              label="Applied"
+              value={stats.totalApplied.toLocaleString()}
+              sub={stats.totalFound > 0 ? `${Math.round((stats.totalApplied / stats.totalFound) * 100)}% of found` : '—'}
+            />
+            <StatCard label="In review" value={stats.inReview} color="text-amber-300" />
+            <StatCard label="Interviews" value={stats.interviews} color="text-emerald-300" sub={`${stats.successRate}% rate`} />
+            <StatCard
+              label="Failed"
+              value={stats.failed}
+              color="text-red-300"
+              sub={stats.failed > 0 ? 'Click to retry →' : 'All clean'}
+              onClick={stats.failed > 0 ? () => {
+                setActiveTab('jobs')
+                setFilterStatus('FAILED')
+              } : undefined}
+            />
+          </div>
         </div>
 
         {/* Tabs */}
