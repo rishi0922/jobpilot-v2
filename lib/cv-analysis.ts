@@ -1,6 +1,40 @@
-import Anthropic from '@anthropic-ai/sdk'
+import { GoogleGenerativeAI } from '@google/generative-ai'
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+/**
+ * CV analysis backed by Google Gemini 2.0 Flash (free tier).
+ *
+ * Previously this module used Anthropic's Claude Sonnet 4 via @anthropic-ai/sdk
+ * which works equally well, but Anthropic is pay-per-use ($10s of API spend for
+ * heavy CV iteration) whereas Gemini gives 1M input tokens/day on its free
+ * tier — far more than a single user would burn even with aggressive use.
+ *
+ * Both SDKs natively accept PDFs as document parts (no Node-side pdf-parse
+ * required), so the swap is mostly a 1:1 API translation. Gemini also supports
+ * a `responseMimeType: 'application/json'` config which guarantees clean JSON
+ * output without the markdown-fence stripping we needed for Claude.
+ *
+ * Exports the same function signatures as the Anthropic version, so callers
+ * (app/api/resumes/analyze/route.ts) don't need to change.
+ */
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '')
+
+// Model + shared generation config. `gemini-2.0-flash` is generally available
+// on the free tier (15 RPM, 1M input tokens/day) and is fast enough that PDF
+// analysis returns in 5-15s. responseMimeType locks the output to JSON so we
+// never see stray markdown fences in the response.
+const MODEL_NAME = 'gemini-2.0-flash'
+
+function getJsonModel() {
+  return genAI.getGenerativeModel({
+    model: MODEL_NAME,
+    generationConfig: {
+      responseMimeType: 'application/json',
+      temperature: 0.4,        // a little creative for suggestions, mostly deterministic
+      maxOutputTokens: 1500,
+    },
+  })
+}
 
 export interface CVAnalysisResult {
   matchScore: number
@@ -45,8 +79,10 @@ ${jobDescription}
 Respond with JSON only. No markdown, no explanation.`
 }
 
-/** Parse the Claude JSON response, with a graceful fallback if it didn't
- *  return valid JSON (rare, but possible if max_tokens truncates). */
+/** Parse the Gemini JSON response, with a graceful fallback. Because we set
+ *  responseMimeType: 'application/json' on the model config, the response
+ *  should already be raw JSON without markdown fences — but we still strip
+ *  them defensively in case the model slips. */
 function parseAnalysisResponse(text: string): CVAnalysisResult {
   try {
     return JSON.parse(text.replace(/```json|```/g, '').trim())
@@ -54,7 +90,7 @@ function parseAnalysisResponse(text: string): CVAnalysisResult {
     return {
       matchScore: 0,
       strengths: [],
-      gaps: ['Analysis failed — could not parse Claude response'],
+      gaps: ['Analysis failed — could not parse Gemini response'],
       suggestions: ['Try again with a shorter CV/JD, or paste CV text directly'],
       keywords: [],
       summary: 'Could not parse analysis.',
@@ -69,50 +105,33 @@ export async function analyzeCV(
   jobDescription: string,
   roleType: string
 ): Promise<CVAnalysisResult> {
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 1000,
-    messages: [{
-      role: 'user',
-      content: buildCvAnalysisPrompt(jobDescription, roleType, cvText),
-    }]
-  })
-  const text = response.content[0].type === 'text' ? response.content[0].text : '{}'
-  return parseAnalysisResponse(text)
+  const model = getJsonModel()
+  const result = await model.generateContent(
+    buildCvAnalysisPrompt(jobDescription, roleType, cvText)
+  )
+  return parseAnalysisResponse(result.response.text())
 }
 
-/** Same analysis, but with the CV supplied as a base64-encoded PDF. Claude
- *  reads PDF documents natively (text + layout), so this avoids needing a
- *  Node-side PDF parser like pdf-parse. The base64 string must NOT include
- *  the `data:application/pdf;base64,` prefix — strip it first. */
+/** Same analysis, but with the CV supplied as a base64-encoded PDF. Gemini
+ *  reads PDFs natively (text + layout) — so this avoids needing a Node-side
+ *  PDF parser. The base64 string must NOT include the
+ *  `data:application/pdf;base64,` prefix — strip it first. */
 export async function analyzeCVFromPdfBase64(
   cvPdfBase64: string,
   jobDescription: string,
   roleType: string
 ): Promise<CVAnalysisResult> {
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 1000,
-    messages: [{
-      role: 'user',
-      content: [
-        {
-          type: 'document',
-          source: {
-            type: 'base64',
-            media_type: 'application/pdf',
-            data: cvPdfBase64,
-          },
-        } as any,
-        {
-          type: 'text',
-          text: buildCvAnalysisPrompt(jobDescription, roleType),
-        },
-      ] as any,
-    }]
-  })
-  const text = response.content[0].type === 'text' ? response.content[0].text : '{}'
-  return parseAnalysisResponse(text)
+  const model = getJsonModel()
+  const result = await model.generateContent([
+    {
+      inlineData: {
+        mimeType: 'application/pdf',
+        data: cvPdfBase64,
+      },
+    },
+    { text: buildCvAnalysisPrompt(jobDescription, roleType) },
+  ])
+  return parseAnalysisResponse(result.response.text())
 }
 
 export async function generatePostApplicationInsights(
@@ -146,13 +165,9 @@ Respond ONLY with valid JSON:
 
 JSON only. No markdown.`
 
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 1000,
-    messages: [{ role: 'user', content: prompt }]
-  })
-
-  const text = response.content[0].type === 'text' ? response.content[0].text : '{}'
+  const model = getJsonModel()
+  const result = await model.generateContent(prompt)
+  const text = result.response.text()
   try {
     return JSON.parse(text.replace(/```json|```/g, '').trim())
   } catch {
@@ -170,12 +185,19 @@ export async function suggestCVForJob(
   jobTitle: string,
   jobDescription: string
 ): Promise<{ roleType: string; confidence: number; reason: string }> {
-  const response = await client.messages.create({
-    model: 'claude-sonnet-4-20250514',
-    max_tokens: 300,
-    messages: [{
-      role: 'user',
-      content: `Given this job posting, which CV type should be used?
+  // Short, structured response — separate model instance with a tight token
+  // cap so we don't burn budget on a 3-line answer.
+  const model = genAI.getGenerativeModel({
+    model: MODEL_NAME,
+    generationConfig: {
+      responseMimeType: 'application/json',
+      temperature: 0.2,
+      maxOutputTokens: 300,
+    },
+  })
+
+  const result = await model.generateContent(
+    `Given this job posting, which CV type should be used?
 
 Job Title: ${jobTitle}
 Description snippet: ${jobDescription?.slice(0, 500)}
@@ -184,10 +206,9 @@ Respond ONLY with JSON:
 {"roleType": "<APM|PM|PROJECT_MANAGER|PROGRAM_MANAGER|BUSINESS_ANALYST>", "confidence": <0-100>, "reason": "<one sentence>"}
 
 JSON only.`
-    }]
-  })
+  )
 
-  const text = response.content[0].type === 'text' ? response.content[0].text : '{}'
+  const text = result.response.text()
   try {
     return JSON.parse(text.replace(/```json|```/g, '').trim())
   } catch {

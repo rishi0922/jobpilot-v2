@@ -7,7 +7,7 @@ Program Manager, and Business Analyst roles in Indian IT. Built with:
 - **Database**: Neon PostgreSQL (free, India-accessible)
 - **Scraper**: Python + Playwright on Render.com (free)
 - **Scheduler**: GitHub Actions (free, runs every 3 hours)
-- **CV Analysis**: Claude AI (Anthropic API)
+- **CV Analysis**: Google Gemini 2.0 Flash (free tier — 1M tokens/day)
 
 ---
 
@@ -42,7 +42,7 @@ Edit `.env.local` and fill in:
 ```
 DATABASE_URL=              # from Step 1
 NEXTAUTH_SECRET=           # run: openssl rand -base64 32
-ANTHROPIC_API_KEY=         # from console.anthropic.com
+GEMINI_API_KEY=            # from aistudio.google.com/apikey (free)
 CREDENTIAL_ENCRYPTION_KEY= # any 32-character string
 SCRAPER_API_KEY=           # make up a long random string
 ```
@@ -145,7 +145,7 @@ Switch anytime using the toggle in the top nav bar.
 
 ### Pre-application scoring
 Paste any job description into Settings → CV Analysis.
-Claude AI scores your CV against it and tells you:
+Gemini scores your CV against it and tells you:
 - Match score (0–100)
 - Strengths that align
 - Gaps to address
@@ -188,7 +188,7 @@ COMMON_FIELD_MAP = {
 | Neon | 3GB storage | More than enough |
 | Render | 750 hrs/mo | Spins down after 15min idle |
 | GitHub Actions | 2000 min/mo | ~66 scraper runs/mo |
-| Anthropic | Pay-per-use | ~₹0.50 per CV analysis |
+| Google Gemini | Free tier: 1M input tokens/day | ~300-500 CV analyses/day on free tier |
 
 ---
 
