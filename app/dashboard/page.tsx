@@ -178,6 +178,7 @@ export default function Dashboard() {
   const [activeTab, setActiveTab] = useState<'overview' | 'jobs' | 'mnc' | 'analysis'>('overview')
   const [filterRole, setFilterRole] = useState('')
   const [filterSource, setFilterSource] = useState('')
+  const [filterCompany, setFilterCompany] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
   // Scraped-date filter: 'all' | 'today' | '7d' | '30d'
   const [filterScrapedWindow, setFilterScrapedWindow] = useState<'all' | 'today' | '7d' | '30d'>('all')
@@ -199,7 +200,7 @@ export default function Dashboard() {
   // Sort state for the jobs list — defaults to newest scraped first so the
   // freshest results are always at the top. Users can switch to match-score
   // sort from the dropdown.
-  const [sortBy, setSortBy] = useState<'matchScore' | 'scrapedAt'>('scrapedAt')
+  const [sortBy, setSortBy] = useState<'matchScore' | 'scrapedAt' | 'company'>('scrapedAt')
   // Client-side pagination of the filtered list — 50 cards per page.
   const [currentPage, setCurrentPage] = useState(1)
   const JOBS_PER_PAGE = 50
@@ -279,15 +280,16 @@ export default function Dashboard() {
   // page index can point past the end of the new (often shorter) list.
   useEffect(() => {
     setCurrentPage(1)
-  }, [filterRole, filterSource, filterStatus, filterScrapedWindow, search, sortBy])
+  }, [filterRole, filterSource, filterCompany, filterStatus, filterScrapedWindow, search, sortBy])
 
   const filteredJobs = jobs
     .filter(j => {
       const matchRole = !filterRole || j.roleType === filterRole
       const matchSource = !filterSource || j.source.toLowerCase() === filterSource.toLowerCase()
+      const matchCompany = !filterCompany || (j.company || '').toLowerCase() === filterCompany.toLowerCase()
       const matchStatus = !filterStatus || j.status === filterStatus
-      const matchSearch = !search || j.title.toLowerCase().includes(search.toLowerCase()) || j.company.toLowerCase().includes(search.toLowerCase())
-      return matchRole && matchSource && matchStatus && matchSearch
+      const matchSearch = !search || j.title.toLowerCase().includes(search.toLowerCase()) || (j.company || '').toLowerCase().includes(search.toLowerCase())
+      return matchRole && matchSource && matchCompany && matchStatus && matchSearch
     })
     .sort((a, b) => {
       if (sortBy === 'matchScore') {
@@ -295,6 +297,14 @@ export default function Dashboard() {
         const ascore = a.matchScore ?? -1
         const bscore = b.matchScore ?? -1
         if (bscore !== ascore) return bscore - ascore
+      } else if (sortBy === 'company') {
+        // A-Z by company; empty/null company strings sink to the bottom
+        const ac = (a.company || '').toLowerCase()
+        const bc = (b.company || '').toLowerCase()
+        if (!ac && bc) return 1
+        if (ac && !bc) return -1
+        const cmp = ac.localeCompare(bc)
+        if (cmp !== 0) return cmp
       }
       // Tie-break / fallback: newest first
       return new Date(b.scrapedAt).getTime() - new Date(a.scrapedAt).getTime()
@@ -786,6 +796,16 @@ export default function Dashboard() {
                 <option value="">All statuses</option>
                 {Object.entries(STATUS_CONFIG).map(([v, c]) => <option key={v} value={v}>{c.label}</option>)}
               </select>
+              {/* Company dropdown — populated from the currently-loaded job list.
+                  Sorted A-Z. Empty/blank company strings are skipped. */}
+              <select value={filterCompany} onChange={e => setFilterCompany(e.target.value)}
+                className="bg-white border border-surface-200 rounded-xl px-3 py-2 text-xs text-ink-secondary outline-none max-w-[180px]"
+                title="Filter by company">
+                <option value="">All companies</option>
+                {Array.from(new Set(jobs.map(j => j.company).filter(Boolean) as string[]))
+                  .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()))
+                  .map(c => <option key={c} value={c}>{c}</option>)}
+              </select>
               <select
                 value={filterScrapedWindow}
                 onChange={e => setFilterScrapedWindow(e.target.value as any)}
@@ -801,6 +821,7 @@ export default function Dashboard() {
                 className="bg-white border border-surface-200 rounded-xl px-3 py-2 text-xs text-ink-secondary outline-none">
                 <option value="matchScore">Sort: Best match</option>
                 <option value="scrapedAt">Sort: Newest</option>
+                <option value="company">Sort: Company A-Z</option>
               </select>
             </div>
 
