@@ -22,6 +22,22 @@ export const maxDuration = 60
  *     No CV input needed; reads Job/Application rows from the DB.
  */
 export async function POST(req: NextRequest) {
+  // Fail fast with a clear message if the Anthropic key is missing on this
+  // deployment — otherwise the SDK throws "Could not resolve authentication
+  // method" from inside the client constructor, which is opaque to a user
+  // looking at the UI. This is a common gotcha after switching Vercel
+  // environments or rotating keys.
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return NextResponse.json(
+      {
+        error:
+          'ANTHROPIC_API_KEY is not set on this deployment. Add it in ' +
+          'Vercel → Settings → Environment Variables, then redeploy.',
+      },
+      { status: 503 }
+    )
+  }
+
   try {
     const body = await req.json()
     const { type, cvText, cvId, jobDescription, roleType, jobId } = body
