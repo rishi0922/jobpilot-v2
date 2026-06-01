@@ -109,13 +109,22 @@ function StatCard({ label, value, sub, color, onClick }: { label: string; value:
       onClick={onClick}
       role={clickable ? 'button' : undefined}
       tabIndex={clickable ? 0 : undefined}
-      className={`bg-white rounded-2xl p-4 border border-surface-200 flex flex-col gap-1 animate-slide-up ${
+      className={`bg-white rounded-2xl p-4 border border-surface-200 flex flex-col gap-1.5 animate-slide-up ${
         clickable ? 'cursor-pointer hover:border-brand-300 hover:shadow-sm transition-all' : ''
       }`}
     >
-      <p className="text-xs text-ink-tertiary font-medium tracking-wide uppercase">{label}</p>
-      <p className={`text-3xl font-semibold ${color || 'text-ink-primary'}`}>{value}</p>
-      {sub && <p className="text-xs text-ink-tertiary">{sub}</p>}
+      {/* Label — small, semibold, more tracked-out so it reads as an
+          editorial caption rather than running into the value below. */}
+      <p className="text-[10px] text-ink-tertiary font-semibold tracking-[0.08em] uppercase">{label}</p>
+      {/* Value — bumped one step (text-3xl → text-4xl), tabular-nums so the
+          digit columns line up across cards (no jitter when 7 vs 12 vs 124),
+          tracking-tight + leading-none to keep the number visually compact
+          and authoritative rather than airy. */}
+      <p className={`text-4xl font-semibold tabular-nums tracking-tight leading-none ${color || 'text-ink-primary'}`}>{value}</p>
+      {/* Sub — slightly smaller than the label so the hierarchy is
+          label > value > sub, even though label and sub are both small.
+          font-medium gives it just enough weight to not vanish. */}
+      {sub && <p className="text-[11px] text-ink-tertiary font-medium">{sub}</p>}
     </div>
   )
 }
