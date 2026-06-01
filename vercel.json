@@ -2,5 +2,11 @@
   "framework": "nextjs",
   "buildCommand": "prisma generate && prisma db push --skip-generate --accept-data-loss && next build",
   "devCommand": "next dev",
-  "installCommand": "npm install"
+  "installCommand": "npm install",
+  "crons": [
+    {
+      "path": "/api/cron/scrape",
+      "schedule": "0 2 * * *"
+    }
+  ]
 }
