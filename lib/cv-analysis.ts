@@ -34,7 +34,11 @@ function getJsonModel() {
     generationConfig: {
       responseMimeType: 'application/json',
       temperature: 0.4,        // a little creative for suggestions, mostly deterministic
-      maxOutputTokens: 1500,
+      // 1500 was too tight — Gemini 2.5-flash often emits a longer JSON
+      // (especially when strengths/gaps lists hit 5 items each), and a
+      // truncated mid-array response then fails JSON.parse. 4096 is enough
+      // for any reasonable analysis result without burning the daily quota.
+      maxOutputTokens: 4096,
     },
   })
 }
@@ -82,22 +86,32 @@ ${jobDescription}
 Respond with JSON only. No markdown, no explanation.`
 }
 
-/** Parse the Gemini JSON response, with a graceful fallback. Because we set
+/** Parse the Gemini JSON response. Because we set
  *  responseMimeType: 'application/json' on the model config, the response
  *  should already be raw JSON without markdown fences — but we still strip
- *  them defensively in case the model slips. */
+ *  them defensively in case the model slips.
+ *
+ *  THROWS on parse failure rather than silently returning a placeholder —
+ *  the route handler catches it and propagates the raw text in the error
+ *  response so we can see what Gemini actually returned. Silent fallbacks
+ *  here previously meant the user saw a meaningless "could not parse"
+ *  result and we had no idea why. */
 function parseAnalysisResponse(text: string): CVAnalysisResult {
+  const stripped = text.replace(/```json|```/g, '').trim()
   try {
-    return JSON.parse(text.replace(/```json|```/g, '').trim())
-  } catch {
-    return {
-      matchScore: 0,
-      strengths: [],
-      gaps: ['Analysis failed — could not parse Gemini response'],
-      suggestions: ['Try again with a shorter CV/JD, or paste CV text directly'],
-      keywords: [],
-      summary: 'Could not parse analysis.',
+    const parsed = JSON.parse(stripped)
+    if (typeof parsed !== 'object' || parsed === null) {
+      throw new Error('Parsed value is not an object')
     }
+    return parsed
+  } catch (err: any) {
+    console.error('[cv-analysis] JSON parse failed:', err?.message)
+    console.error('[cv-analysis] raw Gemini response (first 800 chars):', stripped.slice(0, 800))
+    const e: any = new Error(
+      `Gemini returned non-JSON output. First 300 chars: ${stripped.slice(0, 300)}`
+    )
+    e.rawResponse = stripped
+    throw e
   }
 }
 
@@ -171,9 +185,12 @@ JSON only. No markdown.`
   const model = getJsonModel()
   const result = await model.generateContent(prompt)
   const text = result.response.text()
+  const stripped = text.replace(/```json|```/g, '').trim()
   try {
-    return JSON.parse(text.replace(/```json|```/g, '').trim())
-  } catch {
+    return JSON.parse(stripped)
+  } catch (err: any) {
+    console.error('[cv-analysis:insights] JSON parse failed:', err?.message)
+    console.error('[cv-analysis:insights] raw response (first 800 chars):', stripped.slice(0, 800))
     return {
       successPatterns: [],
       failPatterns: [],

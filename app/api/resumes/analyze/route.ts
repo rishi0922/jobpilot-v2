@@ -125,6 +125,15 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Invalid type. Use pre_application or post_application' }, { status: 400 })
   } catch (err: any) {
     console.error('CV analysis error:', err)
-    return NextResponse.json({ error: err?.message || 'Analysis failed' }, { status: 500 })
+    // If the LLM returned non-JSON, propagate the raw text so the user can
+    // see what came back instead of a generic "could not parse" placeholder.
+    // err.rawResponse is set by parseAnalysisResponse() in lib/cv-analysis.ts.
+    return NextResponse.json(
+      {
+        error:       err?.message || 'Analysis failed',
+        rawResponse: err?.rawResponse || undefined,
+      },
+      { status: 500 }
+    )
   }
 }
