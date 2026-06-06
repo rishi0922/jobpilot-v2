@@ -19,11 +19,14 @@ import { GoogleGenerativeAI } from '@google/generative-ai'
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '')
 
-// Model + shared generation config. `gemini-2.0-flash` is generally available
-// on the free tier (15 RPM, 1M input tokens/day) and is fast enough that PDF
-// analysis returns in 5-15s. responseMimeType locks the output to JSON so we
-// never see stray markdown fences in the response.
-const MODEL_NAME = 'gemini-2.0-flash'
+// Model + shared generation config. `gemini-2.5-flash` is currently the most
+// permissive free-tier model (10 RPM, 250 requests/day, 250K tokens/min).
+// `gemini-2.0-flash` is the older sibling and has been reported by some users
+// to return `limit: 0` errors even on accounts that should have free quota —
+// so we default to 2.5-flash for reliability.
+// responseMimeType locks the output to JSON so we never see stray markdown
+// fences in the response.
+const MODEL_NAME = process.env.GEMINI_MODEL || 'gemini-2.5-flash'
 
 function getJsonModel() {
   return genAI.getGenerativeModel({
