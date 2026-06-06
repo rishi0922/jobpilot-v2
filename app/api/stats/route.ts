@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import prisma from '@/lib/db'
+import { getCurrentUserId } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -13,31 +14,35 @@ const ROLE_LABELS: Record<string, string> = {
 }
 
 export async function GET() {
+  const userId = await getCurrentUserId()
+  if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   try {
+    // Every count/groupBy below is scoped to this user — stats only reflect
+    // the signed-in user's job pool, not the global dataset.
     const [
       totalFound, totalApplied, inReview, interviews, failed,
       byRoleAll, byRoleApplied, byRoleInterview,
       bySource, byStatus, recentRuns,
     ] = await Promise.all([
-      prisma.job.count(),
-      prisma.job.count({ where: { status: { in: ['APPLIED', 'IN_REVIEW', 'INTERVIEW'] } } }),
-      prisma.job.count({ where: { status: 'IN_REVIEW' } }),
-      prisma.job.count({ where: { status: 'INTERVIEW' } }),
-      prisma.job.count({ where: { status: 'FAILED' } }),
-      prisma.job.groupBy({ by: ['roleType'], _count: { id: true } }),
+      prisma.job.count({ where: { userId } }),
+      prisma.job.count({ where: { userId, status: { in: ['APPLIED', 'IN_REVIEW', 'INTERVIEW'] } } }),
+      prisma.job.count({ where: { userId, status: 'IN_REVIEW' } }),
+      prisma.job.count({ where: { userId, status: 'INTERVIEW' } }),
+      prisma.job.count({ where: { userId, status: 'FAILED' } }),
+      prisma.job.groupBy({ by: ['roleType'], _count: { id: true }, where: { userId } }),
       prisma.job.groupBy({
         by: ['roleType'],
         _count: { id: true },
-        where: { status: { in: ['APPLIED', 'IN_REVIEW', 'INTERVIEW'] } },
+        where: { userId, status: { in: ['APPLIED', 'IN_REVIEW', 'INTERVIEW'] } },
       }),
       prisma.job.groupBy({
         by: ['roleType'],
         _count: { id: true },
-        where: { status: 'INTERVIEW' },
+        where: { userId, status: 'INTERVIEW' },
       }),
-      prisma.job.groupBy({ by: ['source'], _count: { id: true }, orderBy: { _count: { id: 'desc' } }, take: 10 }),
-      prisma.job.groupBy({ by: ['status'], _count: { id: true } }),
-      prisma.scraperRun.findMany({ orderBy: { startedAt: 'desc' }, take: 7 }),
+      prisma.job.groupBy({ by: ['source'], _count: { id: true }, where: { userId }, orderBy: { _count: { id: 'desc' } }, take: 10 }),
+      prisma.job.groupBy({ by: ['status'], _count: { id: true }, where: { userId } }),
+      prisma.scraperRun.findMany({ where: { userId }, orderBy: { startedAt: 'desc' }, take: 7 }),
     ])
 
     const appliedByRole = Object.fromEntries(byRoleApplied.map(r => [r.roleType, r._count.id]))

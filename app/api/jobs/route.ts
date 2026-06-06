@@ -1,10 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
+import { getCurrentUserId } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 export async function GET(req: NextRequest) {
+  const userId = await getCurrentUserId()
+  if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   try {
     const { searchParams } = new URL(req.url)
     const roleType = searchParams.get('roleType')
@@ -18,7 +21,7 @@ export async function GET(req: NextRequest) {
     const scrapedAfter  = searchParams.get('scrapedAfter')
     const scrapedBefore = searchParams.get('scrapedBefore')
 
-    const where: any = {}
+    const where: any = { userId }
     if (roleType) where.roleType = roleType
     if (status)   where.status   = status
     if (source)   where.source   = source
@@ -55,9 +58,20 @@ export async function GET(req: NextRequest) {
 }
 
 export async function PATCH(req: NextRequest) {
+  const userId = await getCurrentUserId()
+  if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   try {
     const { id, status, applyMode, cvUsed } = await req.json()
     if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 })
+
+    // Verify ownership before mutating — a logged-in user shouldn't be able
+    // to modify another user's job by guessing the cuid.
+    const owns = await prisma.job.findFirst({
+      where:  { id, userId },
+      select: { id: true },
+    })
+    if (!owns) return NextResponse.json({ error: 'Job not found' }, { status: 404 })
+
     const data: any = { lastUpdated: new Date() }
     if (status !== undefined) data.status = status
     if (applyMode !== undefined) data.applyMode = applyMode

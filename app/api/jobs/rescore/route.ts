@@ -1,19 +1,27 @@
 import { NextResponse } from 'next/server'
 import prisma from '@/lib/db'
 import { scoreJob, type ScoringProfile } from '@/lib/scoring'
+import { getCurrentUserId } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
 /**
- * Re-score every existing job against the latest profile. Called from the
- * Profile settings UI after the user edits their preferences — without this,
- * old jobs keep their stale scores and the dashboard misleads the user.
+ * Re-score every existing job *for the current user* against the latest
+ * profile. Called from the Profile settings UI after the user edits their
+ * preferences — without this, old jobs keep their stale scores and the
+ * dashboard misleads the user.
+ *
+ * Scoped per-user: we only touch this user's jobs, against this user's
+ * profile. A second user re-scoring their profile never affects the first
+ * user's job rankings.
  */
 export async function POST() {
+  const userId = await getCurrentUserId()
+  if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   try {
-    const p = await prisma.profile.findUnique({ where: { id: 'default' } })
+    const p = await prisma.profile.findUnique({ where: { userId } })
     const profile: ScoringProfile | null = p ? {
       yearsExperience:     p.yearsExperience,
       skills:              p.skills || [],
@@ -29,6 +37,7 @@ export async function POST() {
 
     while (true) {
       const batch = await prisma.job.findMany({
+        where: { userId },
         select: {
           id: true, title: true, company: true, location: true,
           description: true, roleType: true, source: true,

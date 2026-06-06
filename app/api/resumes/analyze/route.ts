@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { analyzeCV, analyzeCVFromPdfBase64, generatePostApplicationInsights } from '@/lib/cv-analysis'
 import prisma from '@/lib/db'
+import { getCurrentUserId } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -22,6 +23,9 @@ export const maxDuration = 60
  *     No CV input needed; reads Job/Application rows from the DB.
  */
 export async function POST(req: NextRequest) {
+  const userId = await getCurrentUserId()
+  if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
   // Fail fast with a clear message if the Gemini key is missing on this
   // deployment — otherwise the SDK throws an unhelpful error from inside
   // the client constructor, which is opaque to a user looking at the UI.
@@ -54,8 +58,11 @@ export async function POST(req: NextRequest) {
 
       if (cvId) {
         // Look up the stored CV. fileUrl is a data:application/pdf;base64,... URL.
-        const cv = await prisma.cV.findUnique({
-          where: { id: cvId },
+        // findFirst (not findUnique) so we can enforce the userId guard — a
+        // user can only analyse their own CVs, even if they guess another
+        // user's cuid.
+        const cv = await prisma.cV.findFirst({
+          where: { id: cvId, userId },
           select: { id: true, roleType: true, fileUrl: true, fileName: true },
         })
         if (!cv) {
@@ -77,9 +84,19 @@ export async function POST(req: NextRequest) {
       }
 
       // Persist the analysis if this was tied to a specific job listing.
+      // Verify the job belongs to this user before writing — prevents one
+      // user from manipulating another user's matchScore.
       if (jobId) {
+        const ownsJob = await prisma.job.findFirst({
+          where:  { id: jobId, userId },
+          select: { id: true },
+        })
+        if (!ownsJob) {
+          return NextResponse.json({ error: 'Job not found' }, { status: 404 })
+        }
         await prisma.cvAnalysis.create({
           data: {
+            userId,
             cvId:          cvIdForSave,
             jobId,
             analysisType:  'pre_application',
@@ -101,7 +118,7 @@ export async function POST(req: NextRequest) {
 
     if (type === 'post_application') {
       const jobs = await prisma.job.findMany({
-        where:  { status: { in: ['APPLIED', 'IN_REVIEW', 'INTERVIEW', 'REJECTED', 'FAILED'] } },
+        where:  { userId, status: { in: ['APPLIED', 'IN_REVIEW', 'INTERVIEW', 'REJECTED', 'FAILED'] } },
         select: { roleType: true, company: true, source: true, status: true, cvUsed: true, matchScore: true, description: true },
         take:   100,
         orderBy: { appliedAt: 'desc' },

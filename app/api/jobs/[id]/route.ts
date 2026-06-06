@@ -1,14 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
+import { getCurrentUserId } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-// GET /api/jobs/[id] — full job record incl. description and matchReasons
+// GET /api/jobs/[id] — full job record incl. description and matchReasons.
+// findFirst with userId guard so a logged-in user can't read another
+// user's jobs via guessed cuid.
 export async function GET(_req: NextRequest, ctx: { params: { id: string } }) {
+  const userId = await getCurrentUserId()
+  if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   try {
-    const job = await prisma.job.findUnique({
-      where:  { id: ctx.params.id },
+    const job = await prisma.job.findFirst({
+      where:  { id: ctx.params.id, userId },
       include: {
         applications: {
           orderBy: { submittedAt: 'desc' },

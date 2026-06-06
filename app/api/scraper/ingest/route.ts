@@ -1,13 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
 import { qualityGateReason, scoreJob, type ScoringProfile } from '@/lib/scoring'
+import { resolveScraperUserId } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
-async function loadScoringProfile(): Promise<ScoringProfile | null> {
-  const p = await prisma.profile.findUnique({ where: { id: 'default' } }).catch(() => null)
+async function loadScoringProfile(userId: string): Promise<ScoringProfile | null> {
+  const p = await prisma.profile.findUnique({ where: { userId } }).catch(() => null)
   if (!p) return null
   return {
     yearsExperience:    p.yearsExperience,
@@ -25,21 +26,31 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const { jobs, runId } = await req.json()
+    const body = await req.json()
+    const { jobs, runId } = body
+
+    // Resolve the owning user. Body can specify userId explicitly (preferred,
+    // Commit 4 will make main.py do this); falls back to first admin user for
+    // backward compat with the current single-user Python scraper.
+    const userId = await resolveScraperUserId(body)
+    if (!userId) {
+      return NextResponse.json({ error: 'No users in system' }, { status: 503 })
+    }
+
     if (!jobs?.length) {
       // Empty payload still updates the run as completed (end-of-scrape signal)
       if (runId) {
         await prisma.scraperRun.updateMany({
-          where: { id: runId },
-          data: { status: 'COMPLETED', completedAt: new Date() },
+          where: { id: runId, userId },
+          data:  { status: 'COMPLETED', completedAt: new Date() },
         })
       }
       return NextResponse.json({ saved: 0 })
     }
 
     const applyMode    = process.env.DEFAULT_APPLY_MODE === 'MANUAL' ? 'MANUAL' : 'AUTO'
-    const minAutoScore = await getMinAutoApplyScore()
-    const profile      = await loadScoringProfile()
+    const minAutoScore = await getMinAutoApplyScore(userId)
+    const profile      = await loadScoringProfile(userId)
 
     let saved          = 0
     let skipped        = 0
@@ -82,7 +93,7 @@ export async function POST(req: NextRequest) {
 
       try {
         await prisma.job.upsert({
-          where:  { sourceUrl: job.sourceUrl },
+          where:  { userId_sourceUrl: { userId, sourceUrl: job.sourceUrl } },
           update: {
             lastUpdated:  new Date(),
             // Refresh scoring on re-scrape (description may have updated, profile may have changed)
@@ -91,6 +102,7 @@ export async function POST(req: NextRequest) {
             matchReasons: reasons as any,
           },
           create: {
+            userId,
             title:        job.title,
             company:      job.company,
             location:     job.location || null,
@@ -129,7 +141,7 @@ export async function POST(req: NextRequest) {
       })
     } else if (!runId) {
       await prisma.scraperRun.updateMany({
-        where: { status: 'RUNNING' },
+        where: { userId, status: 'RUNNING' },
         data: { jobsFound: { increment: saved } },
       })
     }
@@ -140,7 +152,7 @@ export async function POST(req: NextRequest) {
 
     // Trigger applicator for AUTO mode jobs (only those that scored above threshold)
     if (applyMode === 'AUTO') {
-      void processQueue()
+      void processQueue(userId)
     }
 
     return NextResponse.json({ saved, skipped, droppedQuality, total: jobs.length })
@@ -150,8 +162,8 @@ export async function POST(req: NextRequest) {
   }
 }
 
-async function getMinAutoApplyScore(): Promise<number> {
-  const p = await prisma.profile.findUnique({ where: { id: 'default' } }).catch(() => null)
+async function getMinAutoApplyScore(userId: string): Promise<number> {
+  const p = await prisma.profile.findUnique({ where: { userId } }).catch(() => null)
   return p?.minMatchScore ?? 60
 }
 
@@ -185,7 +197,7 @@ function mergeReasons(a: Record<string, number>, b: Record<string, number>): Rec
   return out
 }
 
-async function processQueue() {
+async function processQueue(userId: string) {
   const scraperUrl = process.env.SCRAPER_API_URL
   if (!scraperUrl) {
     console.log('[apply-queue] SCRAPER_API_URL not set — skipping auto-apply')
@@ -193,12 +205,12 @@ async function processQueue() {
   }
 
   const queued = await prisma.job.findMany({
-    where: { status: 'QUEUED', applyMode: 'AUTO' },
+    where: { userId, status: 'QUEUED', applyMode: 'AUTO' },
     take: 20,
     orderBy: { scrapedAt: 'asc' },
   })
 
-  console.log(`[apply-queue] ${queued.length} jobs to apply`)
+  console.log(`[apply-queue:${userId}] ${queued.length} jobs to apply`)
 
   let applied = 0
   let failedNoCv = 0
@@ -206,8 +218,10 @@ async function processQueue() {
 
   for (const job of queued) {
     try {
-      // Get the right CV for this role type
-      const cv = await prisma.cV.findUnique({ where: { roleType: job.roleType as any } })
+      // Get the right CV for this role type (user-scoped)
+      const cv = await prisma.cV.findUnique({
+        where: { userId_roleType: { userId, roleType: job.roleType as any } },
+      })
       if (!cv) {
         console.log(`[apply-queue] job ${job.id}: no CV uploaded for roleType=${job.roleType} — marking FAILED`)
         await prisma.job.update({
@@ -218,8 +232,10 @@ async function processQueue() {
         continue
       }
 
-      // Get credentials for this source
-      const cred = await prisma.credential.findUnique({ where: { siteName: capitalise(job.source) } })
+      // Get credentials for this source (user-scoped)
+      const cred = await prisma.credential.findUnique({
+        where: { userId_siteName: { userId, siteName: capitalise(job.source) } },
+      })
       if (!cred) {
         console.log(`[apply-queue] job ${job.id}: no credentials for ${capitalise(job.source)} — applying without login`)
       }
@@ -270,7 +286,7 @@ async function processQueue() {
     }
   }
 
-  console.log(`[apply-queue] done — applied=${applied}, failed-no-cv=${failedNoCv}, failed-api=${failedApi}`)
+  console.log(`[apply-queue:${userId}] done — applied=${applied}, failed-no-cv=${failedNoCv}, failed-api=${failedApi}`)
 }
 
 function capitalise(s: string) {

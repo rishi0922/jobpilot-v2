@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
+import { getCurrentUserId, resolveScraperUserId } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -7,11 +8,20 @@ export const maxDuration = 60
 
 const ALL_SOURCES = ['ats', 'naukri', 'linkedin', 'iimjobs', 'instahyre', 'hirist', 'wellfound', 'mnc']
 
+/**
+ * Trigger a scrape for the current user (when called from the dashboard) or
+ * a specified user (when called by the cron with an API key).
+ *
+ * Two auth modes — same as before but now they resolve a userId:
+ *   1. Same-origin browser session → use NextAuth session userId.
+ *   2. x-api-key header (cron / Render) → expect userId in body, else fall
+ *      back to first admin user.
+ *
+ * The scrape is then per-user: cleanup, ScraperRun row, and the Python
+ * /scrape payload all carry the userId so the rest of the chain stays
+ * scoped to that user.
+ */
 export async function POST(req: NextRequest) {
-  // Auth: allow either an API-key header (GitHub Action / CLI) or a same-origin
-  // request from the dashboard. The dashboard request is trusted because it
-  // hits the route from the same origin in a logged-in browser session; a
-  // public attacker would still need the API key.
   const apiKey = req.headers.get('x-api-key')
   const sameOrigin = (() => {
     const origin = req.headers.get('origin')
@@ -24,8 +34,22 @@ export async function POST(req: NextRequest) {
     }
   })()
 
-  if (process.env.SCRAPER_API_KEY && apiKey !== process.env.SCRAPER_API_KEY && !sameOrigin) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  // ── Auth + userId resolution ────────────────────────────────────────────
+  let userId: string | null = null
+  if (sameOrigin) {
+    // Browser request — require a valid session
+    userId = await getCurrentUserId()
+    if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  } else {
+    // Non-browser caller — require api key
+    if (!process.env.SCRAPER_API_KEY || apiKey !== process.env.SCRAPER_API_KEY) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+    const body = await req.clone().json().catch(() => ({}))
+    userId = await resolveScraperUserId(body)
+    if (!userId) {
+      return NextResponse.json({ error: 'No users in system' }, { status: 503 })
+    }
   }
 
   const scraperUrl = process.env.SCRAPER_API_URL
@@ -33,58 +57,47 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'SCRAPER_API_URL not configured' }, { status: 500 })
   }
 
-  // Cleanup: delete any FOUND/QUEUED/SKIPPED job that hasn't been re-found
-  // for 7 days. We use `lastUpdated` (the scraper now bumps it on every
-  // re-find via /api/scraper/touch-seen, even for dedup-dropped URLs), so
-  // jobs that are still being listed on their source stay alive — only
-  // genuinely stale postings get deleted. We never touch jobs the user has
-  // engaged with (APPLIED / IN_REVIEW / INTERVIEW / REJECTED / FAILED).
+  // Cleanup: delete this user's stale FOUND/QUEUED/SKIPPED jobs (>7 days
+  // without a touch). Scoped by userId so one user's cleanup never touches
+  // another user's data.
   try {
     const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
     const deleted = await prisma.job.deleteMany({
       where: {
+        userId,
         lastUpdated: { lt: cutoff },
         status: { in: ['FOUND', 'QUEUED', 'SKIPPED'] },
       },
     })
     if (deleted.count > 0) {
-      console.log(`[trigger] cleanup: removed ${deleted.count} stale jobs (>7d, no engagement)`)
+      console.log(`[trigger:${userId}] cleanup: removed ${deleted.count} stale jobs`)
     }
   } catch (e) {
-    // Cleanup failure should never block a scrape — just log and proceed
     console.error('[trigger] cleanup failed:', e)
   }
 
   let runId: string | null = null
   try {
     const run = await prisma.scraperRun.create({
-      data: { status: 'RUNNING', sources: ALL_SOURCES },
+      data: { userId, status: 'RUNNING', sources: ALL_SOURCES },
     })
     runId = run.id
 
-    // Kick off the Python scraper. The scraper accepts the request, returns
-    // immediately with 202, and finishes the work in the background — posting
-    // results back to /api/scraper/ingest. We MUST await the kick-off because
-    // Vercel terminates pending promises after the response is sent.
-    //
-    // Render free-tier sleeps after 15 min of inactivity; cold-start takes
-    // 30-50s. We first ping /health to wake it up (with its own long-ish
-    // timeout), then send the actual /scrape request. Vercel maxDuration is
-    // 60s for this route, so total budget is tight but workable.
-    const baseUrl = scraperUrl.replace(/\/+$/, '') // strip trailing slashes
+    const baseUrl = scraperUrl.replace(/\/+$/, '')
 
-    // Step 1: wake-up ping (best-effort, fail silently if it times out)
+    // Step 1: wake-up ping
     const wakeController = new AbortController()
     const wakeTimeout = setTimeout(() => wakeController.abort(), 45000)
     try {
       await fetch(`${baseUrl}/health`, { signal: wakeController.signal })
     } catch {
-      // ignore — we'll surface the error on the /scrape call below
+      // ignore
     } finally {
       clearTimeout(wakeTimeout)
     }
 
-    // Step 2: actual scrape kick-off
+    // Step 2: scrape kick-off. Pass userId in the body so main.py can
+    // forward it to /ingest, /known-urls, /touch-seen, etc.
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 12000)
     let kickedOff = false
@@ -95,7 +108,7 @@ export async function POST(req: NextRequest) {
           'Content-Type': 'application/json',
           'x-api-key': process.env.SCRAPER_API_KEY ?? '',
         },
-        body: JSON.stringify({ runId: run.id, sources: null }),
+        body: JSON.stringify({ runId: run.id, sources: null, userId }),
         signal: controller.signal,
       })
       kickedOff = res.ok || res.status === 202

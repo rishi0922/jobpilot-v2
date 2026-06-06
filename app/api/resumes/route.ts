@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
+import { getCurrentUserId } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -11,6 +12,8 @@ const VALID_ROLES = ['APM', 'PM', 'PROJECT_MANAGER', 'PROGRAM_MANAGER', 'BUSINES
 const MAX_PDF_BYTES = 3 * 1024 * 1024
 
 export async function POST(req: NextRequest) {
+  const userId = await getCurrentUserId()
+  if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   try {
     const formData = await req.formData()
     const file = formData.get('file') as File | null
@@ -52,13 +55,14 @@ export async function POST(req: NextRequest) {
     const fileUrl = `data:application/pdf;base64,${base64String}`
 
     const cv = await prisma.cV.upsert({
-      where: { roleType: roleType as any },
+      where: { userId_roleType: { userId, roleType: roleType as any } },
       update: {
         fileName: file.name,
         fileUrl,
         version: { increment: 1 },
       },
       create: {
+        userId,
         roleType: roleType as any,
         fileName: file.name,
         fileUrl,
@@ -83,8 +87,11 @@ export async function POST(req: NextRequest) {
 }
 
 export async function GET() {
+  const userId = await getCurrentUserId()
+  if (!userId) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   try {
     const cvs = await prisma.cV.findMany({
+      where: { userId },
       select: {
         id: true,
         roleType: true,

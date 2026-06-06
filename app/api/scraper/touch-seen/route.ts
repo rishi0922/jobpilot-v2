@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
+import { resolveScraperUserId } from '@/lib/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -29,13 +30,21 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const { urls } = await req.json()
+    const body = await req.json()
+    const { urls } = body
     if (!Array.isArray(urls) || urls.length === 0) {
       return NextResponse.json({ touched: 0 })
     }
 
+    // Scope the touch to a specific user — never bump lastUpdated on another
+    // user's row even if two users share the same sourceUrl.
+    const userId = await resolveScraperUserId(body)
+    if (!userId) {
+      return NextResponse.json({ error: 'No users in system' }, { status: 503 })
+    }
+
     const res = await prisma.job.updateMany({
-      where: { sourceUrl: { in: urls } },
+      where: { userId, sourceUrl: { in: urls } },
       data:  { lastUpdated: new Date() },
     })
 

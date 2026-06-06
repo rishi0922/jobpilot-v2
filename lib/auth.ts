@@ -135,11 +135,55 @@ export const authOptions: NextAuthOptions = {
   },
 }
 
-/** Helper: get the current user id, or null if not signed in. Use this
- *  inside API routes instead of repeating the getServerSession dance.
- *  Throws if used outside an authed route — call from inside a try/catch. */
+/** Get the current session's userId. Returns null if not signed in. */
 export async function getCurrentUserId(): Promise<string | null> {
   const { getServerSession } = await import('next-auth/next')
   const session = await getServerSession(authOptions)
   return (session?.user as any)?.id ?? null
+}
+
+/** Get the current session's full user object (id + role). Returns null if
+ *  not signed in. Useful for admin-gated routes. */
+export async function getCurrentUser(): Promise<{ id: string; role: string } | null> {
+  const { getServerSession } = await import('next-auth/next')
+  const session = await getServerSession(authOptions)
+  const u = session?.user as any
+  if (!u?.id) return null
+  return { id: u.id, role: u.role || 'USER' }
+}
+
+/**
+ * Resolve userId for scraper-facing routes (those called by the Python
+ * scraper service via x-api-key auth, not by browser sessions).
+ *
+ * Looks for userId in body or query first; falls back to the first ADMIN
+ * user. The fallback is TRANSITIONAL — until Commit 4 updates main.py to
+ * pass userId explicitly, this lets the Python scraper continue working
+ * in single-user mode (everything attributed to the admin).
+ *
+ * Returns null only if there are no users in the system at all (fresh DB),
+ * in which case the caller should return a 503.
+ */
+export async function resolveScraperUserId(
+  body?: any,
+  url?: URL,
+): Promise<string | null> {
+  if (body?.userId && typeof body.userId === 'string') return body.userId
+  if (url) {
+    const fromQuery = url.searchParams.get('userId')
+    if (fromQuery) return fromQuery
+  }
+  // Fallback: first admin user
+  const admin = await prisma.user.findFirst({
+    where:   { role: 'ADMIN' },
+    orderBy: { createdAt: 'asc' },
+    select:  { id: true, email: true },
+  }).catch(() => null)
+  if (admin) {
+    // Log once-per-request so we know when the fallback is in use
+    console.warn(`[scraper-auth] No userId in request; defaulting to admin (${admin.email}).`)
+    return admin.id
+  }
+  console.error('[scraper-auth] No userId in request AND no admin user exists.')
+  return null
 }
