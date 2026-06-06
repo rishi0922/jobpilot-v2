@@ -1028,7 +1028,7 @@ export default function Dashboard() {
                 <div>
                   <h2 className="text-sm font-semibold text-ink-primary">Pre-application CV scorer</h2>
                   <p className="text-xs text-ink-tertiary">
-                    Claude reads your uploaded CV (PDF) and scores it against a job description
+                    Gemini reads your uploaded CV (PDF) and scores it against a job description
                   </p>
                 </div>
               </div>
@@ -1085,7 +1085,7 @@ export default function Dashboard() {
                     <BrainCircuit size={13} className={analyzing ? 'animate-pulse' : ''} />
                     {analyzing ? 'Analysing… (~10-30s)' : 'Analyse with AI'}
                   </button>
-                  <p className="text-xs text-ink-muted mt-2 text-center">Uses Claude · reads PDF directly</p>
+                  <p className="text-xs text-ink-muted mt-2 text-center">Uses Gemini · reads PDF directly</p>
                 </div>
               </div>
 

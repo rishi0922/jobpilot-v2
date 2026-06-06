@@ -33,7 +33,11 @@ function getJsonModel() {
     model: MODEL_NAME,
     generationConfig: {
       responseMimeType: 'application/json',
-      temperature: 0.4,        // a little creative for suggestions, mostly deterministic
+      // Low temperature for scoring consistency — we want the same CV+JD
+      // pair to produce roughly the same score every time. 0.4 caused
+      // generous, encouraging summaries; 0.1 makes the model behave more
+      // like an honest recruiter.
+      temperature: 0.1,
       // 1500 was too tight — Gemini 2.5-flash often emits a longer JSON
       // (especially when strengths/gaps lists hit 5 items each), and a
       // truncated mid-array response then fails JSON.parse. 4096 is enough
@@ -62,20 +66,40 @@ export interface PostApplicationInsight {
 }
 
 /** Build the analysis prompt — same regardless of whether the CV is supplied
- *  as inline text or as a PDF document block. */
+ *  as inline text or as a PDF document block.
+ *
+ *  Scoring rubric is explicit (not "give me 3-5 strengths") because the model
+ *  was previously inventing filler strengths when the JD was sparse and
+ *  scoring CVs that fail explicit constraints (e.g. "no MBA") in the 30-40s
+ *  instead of the 0-15 range they belong in.
+ */
 function buildCvAnalysisPrompt(jobDescription: string, roleType: string, cvText?: string) {
-  return `You are an expert recruiter and career coach specialising in Indian IT product and PM roles.
+  return `You are a senior hiring manager and a tough, honest recruiter for Indian IT product and PM roles. You are NOT a career coach — do not encourage, soften, or invent positives. You score CVs against JDs the way a real hiring manager would: fast, blunt, and willing to give very low scores when the fit is weak.
 
 Analyse the candidate's CV (provided ${cvText ? 'below as plain text' : 'as the attached PDF document'}) against this job description and respond ONLY with valid JSON matching this schema exactly:
 {
   "matchScore": <0-100 integer>,
-  "strengths": [<3-5 strings: what aligns well>],
-  "gaps": [<3-5 strings: what's missing or weak>],
-  "suggestions": [<3-5 actionable improvements to the CV for this role>],
-  "keywords": [<8-12 keywords from JD missing from CV>],
-  "summary": "<2-sentence plain-English verdict>",
+  "strengths": [<0 to 5 strings: only list things that are GENUINELY strong matches with the JD's specific requirements. Empty array is fine and often correct.>],
+  "gaps": [<0 to 5 strings: real gaps relative to the JD. Empty array only if the CV genuinely covers everything stated.>],
+  "suggestions": [<0 to 5 actionable, JD-specific changes. Empty array if the JD is too sparse to suggest anything meaningful.>],
+  "keywords": [<0 to 12 keywords from the JD that are absent from the CV. Empty array if the JD has no real keywords.>],
+  "summary": "<2-sentence honest verdict. State if the JD is too sparse to evaluate properly.>",
   "recommendedCvRole": "<APM|PM|PROJECT_MANAGER|PROGRAM_MANAGER|BUSINESS_ANALYST — best CV type for this JD>"
 }
+
+SCORING RUBRIC (apply strictly):
+- 90-100: Near-perfect match. CV explicitly demonstrates every major requirement. Rare.
+- 70-89: Strong match. Most requirements covered with concrete evidence.
+- 50-69: Decent match. Some requirements covered, some inferred, some missing.
+- 30-49: Weak match. Major requirements absent OR limited evidence for stated requirements.
+- 10-29: Poor match. CV is in a different domain/seniority, OR the JD is too sparse to evaluate fairly, OR the CV violates an explicit JD constraint (e.g. JD says "no MBA" and CV has an MBA → maximum score 20).
+- 0-9: Total mismatch OR the JD is one-line / not a real job description.
+
+HARD RULES:
+- If the JD has an explicit NEGATIVE constraint (e.g. "no MBA", "must not have agency experience") and the CV violates it, cap matchScore at 20. List that violation as the FIRST gap.
+- If the JD is less than ~30 words, fewer than 3 substantive requirements, or otherwise too sparse to evaluate fairly, score it 5-20 and state in the summary that the JD is insufficient.
+- Do NOT invent strengths to fill the array. If you can list only 1 or 2 genuine strengths, do that. Zero strengths is acceptable when the fit is poor.
+- Do NOT count a strength that the JD does not require (e.g. don't list "strong technical background" as a strength if the JD never mentions technical skills).
 
 ROLE TYPE: ${roleType}
 
