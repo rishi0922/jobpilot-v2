@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { useSession, signOut } from 'next-auth/react'
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
   LineChart, Line, CartesianGrid, Legend, PieChart, Pie, Cell
@@ -10,6 +11,7 @@ import {
   Briefcase, Send, Clock, Trophy, AlertCircle, TrendingUp,
   Zap, Eye, RotateCcw, Filter, ChevronDown, ThumbsUp, ThumbsDown,
   X, ExternalLink, CheckCircle2, AlertTriangle, MapPin, Building2,
+  LogOut,
 } from 'lucide-react'
 
 const ROLE_LABELS: Record<string, string> = {
@@ -180,6 +182,7 @@ interface PostApplicationInsight {
 }
 
 export default function Dashboard() {
+  const { data: session } = useSession()
   const [stats, setStats] = useState<DashboardStats>(EMPTY_STATS)
   const [jobs, setJobs] = useState<Job[]>([])
   const [autoApply, setAutoApply] = useState(true)
@@ -622,9 +625,21 @@ export default function Dashboard() {
               <span className="hidden sm:block">Run scraper</span>
             </button>
 
-            <a href="/settings" className="p-2 rounded-xl hover:bg-surface-100 text-ink-tertiary transition-colors">
+            <a href="/settings" className="p-2 rounded-xl hover:bg-surface-100 text-ink-tertiary transition-colors" title="Settings">
               <Settings size={16} />
             </a>
+
+            {/* User identity + sign-out. The email tooltip is enough for now;
+                a fuller user menu (profile, billing, etc.) can come later. */}
+            {session?.user && (
+              <button
+                onClick={() => signOut({ callbackUrl: '/signin' })}
+                className="p-2 rounded-xl hover:bg-surface-100 text-ink-tertiary transition-colors"
+                title={`Sign out (${session.user.email || ''})`}
+              >
+                <LogOut size={16} />
+              </button>
+            )}
           </div>
         </div>
       </header>

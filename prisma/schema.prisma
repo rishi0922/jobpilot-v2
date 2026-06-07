@@ -87,13 +87,31 @@ model VerificationToken {
 
 // Email gate for signup. If a sign-up attempt comes in for an email NOT in
 // this table, we redirect to /waitlist. Admins manage this list via
-// /api/admin/allowlist (built in commit 3).
+// /api/admin/allowlist (built in commit 4).
 model EmailAllowlist {
   id         String   @id @default(cuid())
   email      String   @unique
   note       String?              // optional note: e.g. "friend from PM group"
   invitedBy  String?              // userId of admin who added them
   createdAt  DateTime @default(now())
+}
+
+// People who hit the waitlist landing page and asked for access. Admins
+// review these and promote select entries to EmailAllowlist.
+model WaitlistRequest {
+  id         String   @id @default(cuid())
+  email      String   @unique
+  name       String?
+  reason     String?              // optional "why are you interested?" answer
+  status     WaitlistStatus @default(PENDING)
+  createdAt  DateTime @default(now())
+  reviewedAt DateTime?
+}
+
+enum WaitlistStatus {
+  PENDING
+  APPROVED
+  DECLINED
 }
 
 enum UserRole {

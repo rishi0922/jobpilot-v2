@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from 'next'
 import { DM_Serif_Display } from 'next/font/google'
 import './globals.css'
+import { Providers } from './providers'
 
 const dmSerif = DM_Serif_Display({
   weight: ['400'],
@@ -27,7 +28,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <link rel="preconnect" href="https://fonts.googleapis.com" />
       </head>
       <body className="bg-surface-50 text-ink-primary antialiased">
-        {children}
+        <Providers>{children}</Providers>
       </body>
     </html>
   )
