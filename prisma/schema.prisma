@@ -120,14 +120,25 @@ enum UserRole {
 }
 
 // ── App models — every one is now user-scoped ──────────────────────────────
+//
+// IMPORTANT — `userId` is declared as String? (nullable) on every existing
+// table (Job, CV, Credential, Profile, ScraperRun, CvAnalysis) so the
+// initial `prisma db push` against a populated DB succeeds without a
+// data-loss warning. The migration script (scripts/migrate-to-multiuser.ts)
+// backfills userId on every existing row to point at the first admin user.
+//
+// Application-level enforcement still ensures every NEW row has a userId
+// (every API route uses getCurrentUserId() and refuses requests without
+// a session). DB-level NOT NULL is a defence-in-depth nice-to-have, not
+// load-bearing for correctness.
 
 model Job {
   id            String   @id @default(cuid())
   // User the job belongs to. Same sourceUrl can appear under multiple users
   // (e.g. two users searching for PM roles both find the same Naukri listing)
   // so the @unique on sourceUrl moves from "global" to compound with userId.
-  userId        String
-  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId        String?
+  user          User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   title         String
   company       String
@@ -178,8 +189,8 @@ model Application {
 
 model CV {
   id           String   @id @default(cuid())
-  userId       String
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId       String?
+  user         User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   roleType     RoleType
   fileName     String
@@ -199,8 +210,8 @@ model CV {
 
 model Credential {
   id          String   @id @default(cuid())
-  userId      String
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   siteName    String
   siteUrl     String
@@ -218,8 +229,8 @@ model Credential {
 
 model ScraperRun {
   id           String   @id @default(cuid())
-  userId       String
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId       String?
+  user         User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   startedAt    DateTime @default(now())
   completedAt  DateTime?
@@ -240,8 +251,8 @@ model ScraperRun {
 // callback (set up in lib/auth.ts).
 model Profile {
   id                  String   @id @default(cuid())
-  userId              String   @unique
-  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId              String?  @unique
+  user                User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   fullName            String?
   email               String?
@@ -262,8 +273,8 @@ model Profile {
 
 model CvAnalysis {
   id           String   @id @default(cuid())
-  userId       String
-  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId       String?
+  user         User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   cvId         String
   jobId        String?
