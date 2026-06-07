@@ -42,10 +42,30 @@ Edit `.env.local` and fill in:
 ```
 DATABASE_URL=              # from Step 1
 NEXTAUTH_SECRET=           # run: openssl rand -base64 32
+NEXTAUTH_URL=              # http://localhost:3000 locally, your Vercel URL in prod
 GEMINI_API_KEY=            # from aistudio.google.com/apikey (free)
 CREDENTIAL_ENCRYPTION_KEY= # any 32-character string
 SCRAPER_API_KEY=           # make up a long random string
+GOOGLE_CLIENT_ID=          # OPTIONAL — enables 'Sign in with Google' button
+GOOGLE_CLIENT_SECRET=      # OPTIONAL — get from console.cloud.google.com
 ```
+
+## Multi-user note (post v2)
+
+JobPilot is multi-tenant — every user has their own CVs, jobs, profile,
+credentials and scraper runs. New users sign up at `/signup` but their
+email must be in `EmailAllowlist` first. Unlisted emails are redirected
+to `/waitlist` where they request access. Admins promote requests via
+the `/admin` page.
+
+**Bootstrap (first user):**
+1. Run `npm run db:push` so the new tables exist.
+2. Run the migration: `npx tsx scripts/migrate-to-multiuser.ts`
+   with `FIRST_USER_EMAIL`, `FIRST_USER_PASSWORD`, `FIRST_USER_NAME` env vars.
+   This creates a User row with role=ADMIN, allowlists you, and attaches
+   any pre-existing jobs/CVs/credentials/profile to your account.
+3. Sign in at `/signin`. You'll see a shield icon in the header — that's
+   `/admin` where you manage the allowlist and waitlist.
 
 ---
 

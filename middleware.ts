@@ -19,5 +19,6 @@ export const config = {
   matcher: [
     '/dashboard/:path*',
     '/settings/:path*',
+    '/admin/:path*',   // additionally role-checked inside the page itself
   ],
 }

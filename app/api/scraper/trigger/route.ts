@@ -76,6 +76,15 @@ export async function POST(req: NextRequest) {
     console.error('[trigger] cleanup failed:', e)
   }
 
+  // Per-user search queries — if the user has any in their profile, pass
+  // them to the Python scraper; it'll fall back to its own SEARCH_QUERIES
+  // default when the list is empty.
+  const userProfile = await prisma.profile.findUnique({
+    where:  { userId },
+    select: { searchQueries: true },
+  }).catch(() => null)
+  const queries = userProfile?.searchQueries ?? []
+
   let runId: string | null = null
   try {
     const run = await prisma.scraperRun.create({
@@ -108,7 +117,7 @@ export async function POST(req: NextRequest) {
           'Content-Type': 'application/json',
           'x-api-key': process.env.SCRAPER_API_KEY ?? '',
         },
-        body: JSON.stringify({ runId: run.id, sources: null, userId }),
+        body: JSON.stringify({ runId: run.id, sources: null, userId, queries }),
         signal: controller.signal,
       })
       kickedOff = res.ok || res.status === 202

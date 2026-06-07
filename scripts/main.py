@@ -104,14 +104,21 @@ def verify_api_key(x_api_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Invalid API key")
     return x_api_key
 
-async def get_credentials(site: str) -> dict:
-    """Fetch decrypted credentials from Next.js API. Returns {} on any failure
-    so a missing/cold-started credential service doesn't kill the whole scrape."""
+async def get_credentials(site: str, user_id: Optional[str] = None) -> dict:
+    """Fetch decrypted credentials for a given site (and user) from the Next.js
+    API. Returns {} on any failure so a missing/cold-started credential service
+    doesn't kill the whole scrape.
+
+    Multi-user: the Next.js side scopes credentials by userId. When omitted,
+    that side falls back to the first admin user (transitional)."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
+            payload: dict = {"siteName": site}
+            if user_id:
+                payload["userId"] = user_id
             r = await client.put(
                 f"{NEXT_APP_URL}/api/credentials",
-                json={"siteName": site},
+                json=payload,
                 headers={"x-api-key": SCRAPER_API_KEY},
             )
             if r.status_code == 200:
@@ -146,17 +153,20 @@ async def _keepalive_loop():
         pass  # normal shutdown when scrape completes
 
 
-async def fetch_known_urls() -> set[str]:
-    """Pull the set of sourceUrls already stored in the DB so we can skip them
-    before doing the expensive parse/score/upsert work. Returns an empty set
-    on any failure — a missed dedup is just wasted work, not a correctness
-    bug (DB-level @unique constraint is still the source of truth)."""
+async def fetch_known_urls(user_id: Optional[str] = None) -> set[str]:
+    """Pull the set of sourceUrls already stored in the DB for the given user.
+    Returns an empty set on any failure — a missed dedup is just wasted work,
+    not a correctness bug (DB-level @@unique constraint is still the source
+    of truth).
+
+    Multi-user: user_id is passed as a query param. If omitted, the Next.js
+    side falls back to the first admin user (transitional)."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(
-                f"{NEXT_APP_URL}/api/scraper/known-urls",
-                headers={"x-api-key": SCRAPER_API_KEY},
-            )
+            url = f"{NEXT_APP_URL}/api/scraper/known-urls"
+            if user_id:
+                url += f"?userId={user_id}"
+            r = await client.get(url, headers={"x-api-key": SCRAPER_API_KEY})
             if r.status_code != 200:
                 print(f"[known-urls] HTTP {r.status_code} — proceeding without dedup seed")
                 return set()
@@ -169,15 +179,21 @@ async def fetch_known_urls() -> set[str]:
         return set()
 
 
-async def save_jobs(jobs: list[dict], run_id: str):
-    """Post scraped jobs back to Next.js API."""
+async def save_jobs(jobs: list[dict], run_id: str, user_id: Optional[str] = None):
+    """Post scraped jobs back to the Next.js /ingest endpoint. user_id, when
+    provided, scopes the upsert to that user — same job URL can legitimately
+    belong to multiple users in parallel."""
+    base_payload: dict = {"runId": run_id}
+    if user_id:
+        base_payload["userId"] = user_id
+
     if not jobs:
         # Still notify so the run is marked complete even with 0 jobs
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 await client.post(
                     f"{NEXT_APP_URL}/api/scraper/ingest",
-                    json={"jobs": [], "runId": run_id},
+                    json={**base_payload, "jobs": []},
                     headers={"x-api-key": SCRAPER_API_KEY},
                 )
         except Exception as e:
@@ -187,7 +203,7 @@ async def save_jobs(jobs: list[dict], run_id: str):
         async with httpx.AsyncClient(timeout=60) as client:
             r = await client.post(
                 f"{NEXT_APP_URL}/api/scraper/ingest",
-                json={"jobs": jobs, "runId": run_id},
+                json={**base_payload, "jobs": jobs},
                 headers={"x-api-key": SCRAPER_API_KEY},
             )
             print(f"[ingest] sent {len(jobs)} jobs → HTTP {r.status_code}")
@@ -201,9 +217,16 @@ def health():
 class ScrapeRequest(BaseModel):
     sources: Optional[list[str]] = None
     runId:   Optional[str]       = None
+    # New (multi-user): the user this scrape belongs to. The Next.js trigger
+    # route always sets it; the cron route sets it per-user. If absent, the
+    # Next.js side falls back to the first admin user.
+    userId:  Optional[str]       = None
+    # New: per-user search queries (PM-vs-APM-vs-BA preference). Falls back
+    # to SEARCH_QUERIES if missing or empty.
+    queries: Optional[list[str]] = None
 
 
-async def _run_full_scrape(enabled: list[str], run_id: str):
+async def _run_full_scrape(enabled: list[str], run_id: str, user_id: Optional[str] = None, queries: Optional[list[str]] = None):
     """Background worker that runs every enabled scraper SEQUENTIALLY (one site
     at a time) and posts results back. Sequential execution keeps memory under
     the 512MB Render free-tier limit — each Playwright Chromium instance can
@@ -216,11 +239,18 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
     # while a scrape is in progress. Cancelled at the end of this function.
     keepalive_task = asyncio.create_task(_keepalive_loop())
 
-    # Seed the in-memory dedup set with URLs already in the DB. Cards whose URL
-    # is in this set will be dropped before we run quality-gate / scoring /
-    # upsert — saving the wasted work of re-processing the same job every run.
-    db_known_urls: set[str] = await fetch_known_urls()
+    # Seed the in-memory dedup set with URLs already in the DB for THIS user.
+    # Cards whose URL is in this set will be dropped before we run quality-
+    # gate / scoring / upsert.
+    db_known_urls: set[str] = await fetch_known_urls(user_id)
     seen_urls: set[str] = set(db_known_urls)
+
+    # Per-user search queries override the global default — empty list also
+    # falls back to the default so an unset Profile.searchQueries doesn't
+    # produce zero results.
+    active_queries = queries if (queries and len(queries) > 0) else SEARCH_QUERIES
+    if user_id:
+        print(f"[scrape] user={user_id} queries={len(active_queries)}")
 
     # Track every DB-known URL we encounter during this run so we can bump
     # their `lastUpdated` afterwards via /api/scraper/touch-seen. Without
@@ -237,26 +267,26 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
     # invocation until that source's turn — important because credential
     # fetches can also fail individually.
     async def _naukri():
-        creds = await get_credentials("Naukri")
-        return await scrape_naukri(SEARCH_QUERIES, creds)
+        creds = await get_credentials("Naukri", user_id)
+        return await scrape_naukri(active_queries, creds)
 
     async def _linkedin():
-        creds = await get_credentials("LinkedIn")
-        return await scrape_linkedin(SEARCH_QUERIES, creds)
+        creds = await get_credentials("LinkedIn", user_id)
+        return await scrape_linkedin(active_queries, creds)
 
     async def _iimjobs():
-        creds = await get_credentials("IIMJobs")
-        return await scrape_iimjobs(SEARCH_QUERIES, creds)
+        creds = await get_credentials("IIMJobs", user_id)
+        return await scrape_iimjobs(active_queries, creds)
 
     async def _instahyre():
-        creds = await get_credentials("Instahyre")
-        return await scrape_instahyre(SEARCH_QUERIES, creds)
+        creds = await get_credentials("Instahyre", user_id)
+        return await scrape_instahyre(active_queries, creds)
 
     async def _hirist():
-        return await scrape_hirist(SEARCH_QUERIES, {})
+        return await scrape_hirist(active_queries, {})
 
     async def _wellfound():
-        return await scrape_wellfound(SEARCH_QUERIES, {})
+        return await scrape_wellfound(active_queries, {})
 
     async def _mnc():
         return await scrape_mnc_sites()
@@ -355,12 +385,12 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
             for j in unique:
                 by_tag.setdefault(j["source"], []).append(j)
             for tag, batch in by_tag.items():
-                await save_jobs(batch, run_id)
+                await save_jobs(batch, run_id, user_id)
                 total_saved += len(batch)
 
     # Final ping ensures the run is marked complete in the DB even if 0 jobs
     if total_saved == 0:
-        await save_jobs([], run_id)
+        await save_jobs([], run_id, user_id)
 
     # Bump lastUpdated on every DB-known URL we re-found this run, so the
     # 7-day cleanup doesn't sweep them away. Sent in one batch — the
@@ -368,9 +398,12 @@ async def _run_full_scrape(enabled: list[str], run_id: str):
     if refound_urls:
         try:
             async with httpx.AsyncClient(timeout=60) as client:
+                touch_payload: dict = {"urls": list(refound_urls)}
+                if user_id:
+                    touch_payload["userId"] = user_id
                 r = await client.post(
                     f"{NEXT_APP_URL}/api/scraper/touch-seen",
-                    json={"urls": list(refound_urls)},
+                    json=touch_payload,
                     headers={"x-api-key": SCRAPER_API_KEY},
                 )
                 if r.status_code == 200:
@@ -421,7 +454,7 @@ async def run_scrape(payload: ScrapeRequest, background: BackgroundTasks):
     ]
     run_id = payload.runId or f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
 
-    background.add_task(_run_full_scrape, enabled, run_id)
+    background.add_task(_run_full_scrape, enabled, run_id, payload.userId, payload.queries)
 
     return {
         "runId":     run_id,

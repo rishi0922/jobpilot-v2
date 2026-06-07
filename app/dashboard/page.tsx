@@ -11,7 +11,7 @@ import {
   Briefcase, Send, Clock, Trophy, AlertCircle, TrendingUp,
   Zap, Eye, RotateCcw, Filter, ChevronDown, ThumbsUp, ThumbsDown,
   X, ExternalLink, CheckCircle2, AlertTriangle, MapPin, Building2,
-  LogOut,
+  LogOut, ShieldCheck,
 } from 'lucide-react'
 
 const ROLE_LABELS: Record<string, string> = {
@@ -628,6 +628,15 @@ export default function Dashboard() {
             <a href="/settings" className="p-2 rounded-xl hover:bg-surface-100 text-ink-tertiary transition-colors" title="Settings">
               <Settings size={16} />
             </a>
+
+            {/* Admin console — only shown to ADMIN users. The role is on the
+                JWT (set by lib/auth.ts callbacks) so this is just a UI hint;
+                /api/admin/* routes enforce the role on the server side too. */}
+            {(session?.user as any)?.role === 'ADMIN' && (
+              <a href="/admin" className="p-2 rounded-xl hover:bg-surface-100 text-ink-tertiary transition-colors" title="Admin">
+                <ShieldCheck size={16} />
+              </a>
+            )}
 
             {/* User identity + sign-out. The email tooltip is enough for now;
                 a fuller user menu (profile, billing, etc.) can come later. */}
