@@ -43,6 +43,7 @@ model User {
   jobs            Job[]
   cvAnalyses      CvAnalysis[]
   scraperRuns     ScraperRun[]
+  appliedRoles    AppliedRole[]
 }
 
 // NextAuth: OAuth account link (one per provider per user)
@@ -289,7 +290,56 @@ model CvAnalysis {
   @@index([userId])
 }
 
-// ── Enums (unchanged) ───────────────────────────────────────────────────────
+// Durable record of a job the user applied to. Deliberately self-contained:
+// it SNAPSHOTS the job's details (title, company, JD text, match score) at
+// apply-time and holds only a soft `jobId` string (no FK / cascade) so the
+// record survives even when the original Job row is deleted by the 7-day
+// cleanup or the listing disappears. This is the permanent "what have I
+// applied to" history.
+model AppliedRole {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Soft reference back to the live Job row, if it still exists. Not a
+  // relation — we never want a Job deletion to cascade into history.
+  jobId           String?
+
+  // Snapshot of the job at the moment of applying
+  title           String
+  company         String
+  location        String?
+  source          String
+  sourceUrl       String
+  roleType        RoleType
+  jobDescription  String?   // full JD text frozen at apply-time
+  matchScoreAtApply Int?    // the match score the job had when applied
+  cvUsed          String?   // which CV (role type) was used
+
+  // Outcome tracking — updated by the user over time
+  outcome         ApplicationOutcome @default(APPLIED)
+  outcomeNotes    String?
+
+  appliedAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // One history row per (user, job URL). Re-marking the same job as applied
+  // updates the existing row rather than creating duplicates.
+  @@unique([userId, sourceUrl])
+  @@index([userId])
+  @@index([outcome])
+}
+
+// ── Enums ────────────────────────────────────────────────────────────────────
+
+enum ApplicationOutcome {
+  APPLIED
+  IN_REVIEW
+  INTERVIEW
+  OFFER
+  REJECTED
+  WITHDRAWN
+}
 
 enum RoleType {
   APM

@@ -154,6 +154,34 @@ function MatchScore({ score }: { score: number | null }) {
   )
 }
 
+// ── Applications history ──
+interface AppliedRole {
+  id: string
+  jobId: string | null
+  title: string
+  company: string
+  location: string | null
+  source: string
+  sourceUrl: string
+  roleType: string
+  jobDescription: string | null
+  matchScoreAtApply: number | null
+  cvUsed: string | null
+  outcome: 'APPLIED' | 'IN_REVIEW' | 'INTERVIEW' | 'OFFER' | 'REJECTED' | 'WITHDRAWN'
+  outcomeNotes: string | null
+  appliedAt: string
+  updatedAt: string
+}
+
+const OUTCOME_CONFIG: Record<string, { label: string; color: string; bg: string }> = {
+  APPLIED:   { label: 'Applied',    color: '#4f46e5', bg: '#eef2ff' },
+  IN_REVIEW: { label: 'In review',  color: '#b45309', bg: '#fffbeb' },
+  INTERVIEW: { label: 'Interview',  color: '#0e7490', bg: '#ecfeff' },
+  OFFER:     { label: 'Offer',      color: '#15803d', bg: '#f0fdf4' },
+  REJECTED:  { label: 'Rejected',   color: '#b91c1c', bg: '#fef2f2' },
+  WITHDRAWN: { label: 'Withdrawn',  color: '#6b7280', bg: '#f3f4f6' },
+}
+
 // ── CV Analysis types ──
 interface CvOption {
   id: string
@@ -185,9 +213,10 @@ export default function Dashboard() {
   const { data: session } = useSession()
   const [stats, setStats] = useState<DashboardStats>(EMPTY_STATS)
   const [jobs, setJobs] = useState<Job[]>([])
+  const [applications, setApplications] = useState<AppliedRole[]>([])
   const [autoApply, setAutoApply] = useState(true)
   // 'mnc' is a synthetic tab — same UI as 'jobs' but pre-filtered to source='mnc'.
-  const [activeTab, setActiveTab] = useState<'overview' | 'jobs' | 'mnc' | 'analysis'>('overview')
+  const [activeTab, setActiveTab] = useState<'overview' | 'jobs' | 'mnc' | 'applications' | 'analysis'>('overview')
   const [filterRole, setFilterRole] = useState('')
   const [filterSource, setFilterSource] = useState('')
   const [filterCompany, setFilterCompany] = useState('')
@@ -490,6 +519,39 @@ export default function Dashboard() {
     }
   }, [activeTab, cvOptions.length, cvLoadError, loadCvOptions])
 
+  // ── Applications history ──
+  const loadApplications = useCallback(async () => {
+    try {
+      const res = await fetch('/api/applications', { cache: 'no-store' })
+      if (!res.ok) return
+      const data = await res.json()
+      setApplications(data.rows || [])
+    } catch (err) {
+      console.error('Failed to load applications', err)
+    }
+  }, [])
+
+  // Load applications whenever that tab is opened (and once on mount so the
+  // tab count badge is populated).
+  useEffect(() => { loadApplications() }, [loadApplications])
+  useEffect(() => {
+    if (activeTab === 'applications') loadApplications()
+  }, [activeTab, loadApplications])
+
+  // Update an application's outcome (and optionally notes), then refresh.
+  async function updateApplicationOutcome(id: string, outcome: string, outcomeNotes?: string) {
+    try {
+      await fetch('/api/applications', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, outcome, ...(outcomeNotes !== undefined ? { outcomeNotes } : {}) }),
+      })
+      await loadApplications()
+    } catch (err) {
+      console.error('Failed to update application', err)
+    }
+  }
+
   /** Pre-application analysis. Sends the selected CV id + pasted JD to
    *  the backend, which calls Claude with the PDF attached. */
   async function runCvAnalysis() {
@@ -579,10 +641,11 @@ export default function Dashboard() {
   }
 
   const tabs = [
-    { id: 'overview', label: 'Overview' },
-    { id: 'jobs',     label: `All Jobs (${filteredJobs.length})` },
-    { id: 'mnc',      label: `MNC Jobs (${mncCount})` },
-    { id: 'analysis', label: 'CV Analysis' },
+    { id: 'overview',     label: 'Overview' },
+    { id: 'jobs',         label: `All Jobs (${filteredJobs.length})` },
+    { id: 'mnc',          label: `MNC Jobs (${mncCount})` },
+    { id: 'applications', label: `Applications (${applications.length})` },
+    { id: 'analysis',     label: 'CV Analysis' },
   ]
 
   return (
@@ -1036,6 +1099,78 @@ export default function Dashboard() {
                 </div>
               )}
             </div>
+          </div>
+        )}
+
+        {/* ===== APPLICATIONS TAB ===== */}
+        {activeTab === 'applications' && (
+          <div className="animate-fade-in">
+            <div className="flex items-center justify-between mb-4">
+              <div>
+                <h2 className="text-sm font-semibold text-ink-primary">Applied roles</h2>
+                <p className="text-xs text-ink-tertiary">
+                  Permanent history of every role you&rsquo;ve applied to — kept even after the listing expires.
+                </p>
+              </div>
+            </div>
+
+            {applications.length === 0 ? (
+              <div className="bg-white rounded-2xl border border-surface-200 p-10 text-center">
+                <Send size={20} className="text-ink-muted mx-auto mb-2" />
+                <p className="text-sm text-ink-secondary">No applications yet</p>
+                <p className="text-xs text-ink-tertiary mt-1">
+                  Mark a job as applied (or let auto-apply run) and it&rsquo;ll show up here.
+                </p>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {applications.map(a => {
+                  const cfg = OUTCOME_CONFIG[a.outcome] || OUTCOME_CONFIG.APPLIED
+                  return (
+                    <div key={a.id} className="bg-white rounded-2xl border border-surface-200 p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <h3 className="text-sm font-semibold text-ink-primary truncate">{a.title}</h3>
+                            {a.matchScoreAtApply != null && (
+                              <span className="text-[10px] text-ink-tertiary">· {a.matchScoreAtApply} match at apply</span>
+                            )}
+                          </div>
+                          <p className="text-xs text-ink-secondary mt-0.5">
+                            <span className="inline-flex items-center gap-1"><Building2 size={11} />{a.company || '—'}</span>
+                            {a.location && <span className="inline-flex items-center gap-1 ml-2"><MapPin size={11} />{a.location}</span>}
+                          </p>
+                          <p className="text-[10px] text-ink-muted mt-1">
+                            {ROLE_LABELS[a.roleType] || a.roleType} · via {a.source} · applied{' '}
+                            {new Date(a.appliedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
+                            {a.cvUsed && ` · CV: ${ROLE_LABELS[a.cvUsed] || a.cvUsed}`}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          {a.sourceUrl && (
+                            <a href={a.sourceUrl} target="_blank" rel="noopener noreferrer"
+                              className="p-1.5 rounded-lg hover:bg-surface-100 text-ink-tertiary" title="Open listing">
+                              <ExternalLink size={14} />
+                            </a>
+                          )}
+                          {/* Outcome dropdown — updates the durable record */}
+                          <select
+                            value={a.outcome}
+                            onChange={e => updateApplicationOutcome(a.id, e.target.value)}
+                            className="rounded-lg border px-2 py-1 text-xs font-medium outline-none cursor-pointer"
+                            style={{ color: cfg.color, background: cfg.bg, borderColor: cfg.bg }}
+                          >
+                            {Object.entries(OUTCOME_CONFIG).map(([v, c]) => (
+                              <option key={v} value={v} style={{ color: '#0f1117', background: '#fff' }}>{c.label}</option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
           </div>
         )}
 

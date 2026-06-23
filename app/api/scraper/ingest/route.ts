@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
 import { qualityGateReason, scoreJob, type ScoringProfile } from '@/lib/scoring'
 import { resolveScraperUserId } from '@/lib/auth'
+import { recordAppliedRole } from '@/lib/applications'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -274,7 +275,23 @@ async function processQueue(userId: string) {
           matchNotes: result.message ? String(result.message).slice(0, 500) : null,
         },
       })
-      if (success) applied++
+      if (success) {
+        applied++
+        // Durable history snapshot on successful auto-apply.
+        await recordAppliedRole({
+          userId,
+          jobId:             job.id,
+          title:             job.title,
+          company:           job.company,
+          location:          job.location,
+          source:            job.source,
+          sourceUrl:         job.sourceUrl,
+          roleType:          job.roleType,
+          jobDescription:    job.description,
+          matchScoreAtApply: job.matchScore,
+          cvUsed:            job.roleType,
+        })
+      }
       else failedApi++
     } catch (e: any) {
       console.error(`[apply-queue] job ${job.id} unexpected error:`, e?.message || e)

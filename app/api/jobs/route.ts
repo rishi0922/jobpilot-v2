@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import prisma from '@/lib/db'
 import { getCurrentUserId } from '@/lib/auth'
+import { recordAppliedRole } from '@/lib/applications'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -65,10 +66,10 @@ export async function PATCH(req: NextRequest) {
     if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 })
 
     // Verify ownership before mutating — a logged-in user shouldn't be able
-    // to modify another user's job by guessing the cuid.
+    // to modify another user's job by guessing the cuid. Pull the full row so
+    // we can snapshot it into AppliedRole history if this is a mark-applied.
     const owns = await prisma.job.findFirst({
-      where:  { id, userId },
-      select: { id: true },
+      where: { id, userId },
     })
     if (!owns) return NextResponse.json({ error: 'Job not found' }, { status: 404 })
 
@@ -78,6 +79,25 @@ export async function PATCH(req: NextRequest) {
     if (cvUsed !== undefined) data.cvUsed = cvUsed
     if (status === 'APPLIED') data.appliedAt = new Date()
     const updated = await prisma.job.update({ where: { id }, data })
+
+    // On transition to APPLIED, write a durable history row that snapshots
+    // the job so it survives the eventual cleanup of the live Job row.
+    if (status === 'APPLIED') {
+      await recordAppliedRole({
+        userId,
+        jobId:             owns.id,
+        title:             owns.title,
+        company:           owns.company,
+        location:          owns.location,
+        source:            owns.source,
+        sourceUrl:         owns.sourceUrl,
+        roleType:          owns.roleType,
+        jobDescription:    owns.description,
+        matchScoreAtApply: owns.matchScore,
+        cvUsed:            cvUsed ?? owns.cvUsed ?? owns.roleType,
+      })
+    }
+
     return NextResponse.json(updated)
   } catch (err: any) {
     console.error('PATCH /api/jobs error:', err)
