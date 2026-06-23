@@ -11,13 +11,37 @@ inspecting the URL or page source for the brand. If a company changes ATS
 vendors, just update the company's entry below.
 """
 
+import asyncio
 from datetime import datetime
 from typing import Iterable, Optional
 
 import httpx
 
-# Per-request timeouts (seconds) — ATS APIs are usually fast (<2s)
-HTTP_TIMEOUT = 15.0
+# ── Timeout / concurrency tuning ────────────────────────────────────────────
+#
+# ATS APIs are usually fast (<2s) but some hosts (we've seen Ashby, Lever's
+# spotify, greenhouse's plaid) intermittently hang. The old code ran every
+# company sequentially with a flat 15s timeout, so a handful of hung hosts
+# could push a single ATS run past 10 minutes — exactly the kind of stall
+# that eats the per-source budget in main.py.
+#
+# Fixes here:
+#   - Split connect vs read timeouts so a dead host fails fast on connect.
+#   - Run companies CONCURRENTLY with a bounded semaphore (so we don't open
+#     60 sockets at once and trip rate limits or memory).
+#   - Wrap each company fetch in asyncio.wait_for as a hard ceiling that
+#     can't be exceeded no matter how the underlying client misbehaves.
+#   - One quiet retry on timeout, since ATS hiccups are usually transient.
+HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=5.0)
+
+# Hard per-company ceiling. Even with retry, a single company can never block
+# the run for more than ~2× this. Kept comfortably under main.py's 240s
+# per-source budget given the concurrency below.
+PER_COMPANY_CEILING = 20.0
+
+# Max simultaneous in-flight requests. 8 keeps us well under any sane rate
+# limit while making a ~70-company sweep finish in well under a minute.
+MAX_CONCURRENCY = 8
 
 # Curated list of Indian / India-friendly product companies (PM-heavy hiring)
 # Format:
@@ -56,6 +80,32 @@ GREENHOUSE_COMPANIES: list[tuple[str, str]] = [
     ("Vimeo",             "vimeo"),
     ("Affirm",            "affirm"),
     ("Brex",              "brex"),
+    # ── Expansion (Indian product cos + India-hiring globals on Greenhouse) ──
+    ("PhonePe",           "phonepe"),
+    ("Flipkart",          "flipkart"),
+    ("Swiggy",            "swiggy"),
+    ("Sprinklr",          "sprinklr"),
+    ("Dream11",           "dreamsports"),
+    ("MPL",               "mpl"),
+    ("ShareChat",         "sharechat"),
+    ("Chargebee",         "chargebee"),
+    ("Whatfix",           "whatfix"),
+    ("MoEngage",          "moengage"),
+    ("Hasura",            "hasura"),
+    ("Yellowai",          "yellowmessenger"),
+    ("Innovaccer",        "innovaccer"),
+    ("HackerRank",        "hackerrank"),
+    ("Druva",             "druva"),
+    ("Gupshup",           "gupshup"),
+    ("Databricks",        "databricks"),
+    ("MongoDB",           "mongodb"),
+    ("Elastic",           "elastic"),
+    ("GitLab",            "gitlab"),
+    ("HubSpot",           "hubspot"),
+    ("Airtable",          "airtable"),
+    ("Rippling",          "rippling"),
+    ("Wise",              "wise"),
+    ("Grafana",           "grafanalabs"),
 ]
 
 LEVER_COMPANIES: list[tuple[str, str]] = [
@@ -72,6 +122,12 @@ LEVER_COMPANIES: list[tuple[str, str]] = [
     ("KKR",               "kkr"),
     ("Github",            "github"),
     ("Palantir",          "palantir"),
+    # ── Expansion ──
+    ("Jupiter",           "jupiter"),
+    ("Rupeek",            "rupeek"),
+    ("Cashfree",          "cashfree"),
+    ("Plum",              "plumhq"),
+    ("Hightouch",         "hightouch"),
 ]
 
 ASHBY_COMPANIES: list[tuple[str, str]] = [
@@ -84,6 +140,10 @@ ASHBY_COMPANIES: list[tuple[str, str]] = [
     ("OpenAI",            "openai"),
     ("ElevenLabs",        "elevenlabs"),
     ("Mercury",           "mercury"),
+    # ── Expansion ──
+    ("Deel",              "deel"),
+    ("Posthog",           "posthog"),
+    ("Clipboard",         "clipboardhealth"),
 ]
 
 
@@ -249,25 +309,71 @@ def _strip_html(html: str) -> str:
 
 # ── Public entrypoint ───────────────────────────────────────────────────────
 
+async def _fetch_with_ceiling(
+    fetch_fn,
+    client: httpx.AsyncClient,
+    vendor: str,
+    name: str,
+    slug: str,
+) -> list[dict]:
+    """Run one company fetch with a hard wall-clock ceiling and a single
+    retry on timeout. Guarantees that no individual company can stall the
+    overall sweep — whatever happens inside the httpx call, we abandon it
+    after PER_COMPANY_CEILING seconds and move on.
+
+    Returns [] on any failure (timeout, connect error, bad slug → 404).
+    Never raises, so one bad company can't break asyncio.gather."""
+    for attempt in (1, 2):
+        try:
+            return await asyncio.wait_for(
+                fetch_fn(client, slug),
+                timeout=PER_COMPANY_CEILING,
+            )
+        except asyncio.TimeoutError:
+            if attempt == 1:
+                # transient hiccup — quiet retry once
+                continue
+            print(f"[ats:{vendor}:{name}] ceiling timeout ({PER_COMPANY_CEILING}s) — skipping")
+            return []
+        except Exception as e:
+            print(f"[ats:{vendor}:{name}] {type(e).__name__}: {e}")
+            return []
+    return []
+
+
 async def scrape_ats(_queries: Optional[list[str]] = None, _credentials: Optional[dict] = None) -> list[dict]:
-    """Scrape every configured ATS company, sequentially. Each company is one
-    HTTP call (no Playwright) so this is cheap and fast — running all ~50
-    companies takes ~30-60 seconds total."""
-    out: list[dict] = []
+    """Scrape every configured ATS company CONCURRENTLY (bounded by a
+    semaphore). Each company is one HTTP call (no Playwright), wrapped in a
+    hard per-company ceiling so a hung host can't stall the run. With ~70
+    companies at MAX_CONCURRENCY in-flight, a full sweep finishes in well
+    under a minute even when several hosts are slow."""
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    # Build the work list: (vendor, name, slug, fetch_fn)
+    work: list[tuple[str, str, str, object]] = []
+    for name, slug in GREENHOUSE_COMPANIES:
+        work.append(("greenhouse", name, slug, _fetch_greenhouse))
+    for name, slug in LEVER_COMPANIES:
+        work.append(("lever", name, slug, _fetch_lever))
+    for name, slug in ASHBY_COMPANIES:
+        work.append(("ashby", name, slug, _fetch_ashby))
+
     async with httpx.AsyncClient(headers={"User-Agent": "JobPilot/1.0"}) as client:
-        for name, slug in GREENHOUSE_COMPANIES:
-            jobs = await _fetch_greenhouse(client, slug)
-            if jobs:
-                print(f"[ats:greenhouse:{name}] {len(jobs)} matching jobs")
-            out.extend(jobs)
-        for name, slug in LEVER_COMPANIES:
-            jobs = await _fetch_lever(client, slug)
-            if jobs:
-                print(f"[ats:lever:{name}] {len(jobs)} matching jobs")
-            out.extend(jobs)
-        for name, slug in ASHBY_COMPANIES:
-            jobs = await _fetch_ashby(client, slug)
-            if jobs:
-                print(f"[ats:ashby:{name}] {len(jobs)} matching jobs")
-            out.extend(jobs)
+        async def _one(vendor: str, name: str, slug: str, fn) -> list[dict]:
+            async with sem:  # bound concurrency
+                jobs = await _fetch_with_ceiling(fn, client, vendor, name, slug)
+                if jobs:
+                    print(f"[ats:{vendor}:{name}] {len(jobs)} matching jobs")
+                return jobs
+
+        results = await asyncio.gather(
+            *[_one(v, n, s, fn) for (v, n, s, fn) in work],
+            return_exceptions=True,  # a stray raise never sinks the whole gather
+        )
+
+    out: list[dict] = []
+    for r in results:
+        if isinstance(r, list):
+            out.extend(r)
+        # exceptions already logged inside _fetch_with_ceiling; ignore here
     return out
