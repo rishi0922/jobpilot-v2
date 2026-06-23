@@ -81,15 +81,27 @@ async def scrape_iimjobs(queries: list[str], credentials: dict) -> list[dict]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=LOW_MEM_CHROMIUM_ARGS)
         context = await new_stealth_context(browser)
-        page = await context.new_page()
 
         if credentials.get("username") and credentials.get("password"):
-            await _safe_login(page, credentials, "iimjobs", f"{BASE}/candidate/login")
+            login_page = await context.new_page()
+            try:
+                await _safe_login(login_page, credentials, "iimjobs", f"{BASE}/candidate/login")
+            finally:
+                await login_page.close()
 
         for query in queries:
             # Per-query timeout. IIMJobs tries 4 URL shapes per query, each
             # with its own ~25s goto + 8s networkidle. 120s budget lets all
             # 4 fall through cleanly when the first one(s) are slow.
+            #
+            # CRITICAL: each query gets its OWN page. asyncio.wait_for cancels
+            # the coroutine mid-Playwright-operation on timeout, which leaves
+            # that page in an unusable state (InvalidStateError on next use).
+            # A throwaway page per query means a timeout only burns that page,
+            # and the next query starts clean. (This is the fix for the
+            # "[iimjobs] scrape error: InvalidStateError" that previously
+            # killed every query after the first timeout.)
+            page = await context.new_page()
             try:
                 found_for_query = await asyncio.wait_for(
                     _scrape_one_query(page, query), timeout=120
@@ -100,6 +112,12 @@ async def scrape_iimjobs(queries: list[str], credentials: dict) -> list[dict]:
                 print(f"[iimjobs] '{query}' timed out after 120s")
             except Exception as e:
                 print(f"[iimjobs] '{query}': {type(e).__name__}: {e}")
+            finally:
+                # Close even if the page is half-broken; ignore close errors.
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
         await context.close()
         await browser.close()

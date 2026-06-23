@@ -69,29 +69,40 @@ async def scrape_naukri(queries: list[str], credentials: dict) -> list[dict]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=LOW_MEM_CHROMIUM_ARGS)
         context = await new_stealth_context(browser)
-        page = await context.new_page()
 
-        # Visit the homepage once so Naukri can set its first-party cookies
-        # (bot-check token, geo, etc.). This is what lets the subsequent
-        # JSON API calls succeed instead of returning HTTP 406.
+        # Warm-up + login happen on a dedicated setup page. Cookies are stored
+        # at the CONTEXT level, so the per-query pages created below inherit
+        # the bot-check token / geo cookies set here — that's what lets the
+        # subsequent in-page JSON API calls succeed instead of HTTP 406.
+        setup_page = await context.new_page()
         try:
-            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20000)
+            await setup_page.goto(BASE_URL, wait_until="domcontentloaded", timeout=20000)
             try:
-                await page.wait_for_load_state("networkidle", timeout=8000)
+                await setup_page.wait_for_load_state("networkidle", timeout=8000)
             except PlaywrightTimeout:
                 pass
         except Exception as e:
             print(f"[naukri] homepage warm-up failed: {type(e).__name__}: {e}")
 
         if credentials.get("username") and credentials.get("password"):
-            await _safe_login(page, credentials, "naukri", f"{BASE_URL}/nlogin/login")
+            await _safe_login(setup_page, credentials, "naukri", f"{BASE_URL}/nlogin/login")
+
+        try:
+            await setup_page.close()
+        except Exception:
+            pass
 
         for query in queries:
             kept_for_query = 0
 
-            # Per-query timeout. Naukri can hang on any one of: homepage
-            # warm-up redirect, page goto, in-browser fetch, or networkidle.
-            # 90s budget covers 3 pages × ~25s each even on a slow run.
+            # Per-query timeout. Naukri can hang on any one of: page goto,
+            # in-browser fetch, or networkidle. 90s budget covers 3 pages ×
+            # ~25s each even on a slow run.
+            #
+            # Fresh page per query: a wait_for timeout cancels mid-Playwright-
+            # op and corrupts the page (InvalidStateError on next use). A
+            # throwaway page (same context, so cookies persist) isolates that.
+            page = await context.new_page()
             try:
                 kept_for_query = await asyncio.wait_for(
                     _scrape_query_pages(page, query, jobs, seen),
@@ -100,6 +111,14 @@ async def scrape_naukri(queries: list[str], credentials: dict) -> list[dict]:
             except asyncio.TimeoutError:
                 print(f"[naukri] '{query}' timed out after 90s")
                 kept_for_query = 0
+            except Exception as e:
+                print(f"[naukri] '{query}': {type(e).__name__}: {e}")
+                kept_for_query = 0
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
             print(f"[naukri] '{query}' → {kept_for_query} jobs across "
                   f"{HTML_PAGES_PER_QUERY} pages")

@@ -47,11 +47,17 @@ async def scrape_hirist(queries: list[str], _credentials: dict) -> list[dict]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=LOW_MEM_CHROMIUM_ARGS)
         context = await new_stealth_context(browser)
-        page = await context.new_page()
 
         for query in queries:
             # 120s per query covers Hirist's 4-URL retry pattern (~25s goto
             # × 4 URLs + networkidle/wait overhead).
+            #
+            # Each query gets its OWN page: asyncio.wait_for cancels the
+            # coroutine mid-Playwright-op on timeout, corrupting the page
+            # (InvalidStateError on next use). A throwaway page per query
+            # isolates that, so a timeout no longer kills the remaining
+            # queries for this source.
+            page = await context.new_page()
             try:
                 found = await asyncio.wait_for(
                     _scrape_one_query(page, query), timeout=120
@@ -62,6 +68,11 @@ async def scrape_hirist(queries: list[str], _credentials: dict) -> list[dict]:
                 print(f"[hirist] '{query}' timed out after 120s")
             except Exception as e:
                 print(f"[hirist] '{query}': {type(e).__name__}: {e}")
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
         await context.close()
         await browser.close()

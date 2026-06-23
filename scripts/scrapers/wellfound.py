@@ -54,12 +54,16 @@ async def scrape_wellfound(queries: list[str], _credentials: dict) -> list[dict]
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=LOW_MEM_CHROMIUM_ARGS)
         context = await new_stealth_context(browser)
-        page = await context.new_page()
 
         for query in queries:
             # 45s per query — with 2-URL retry × ~20s each (15s goto + 3s
             # networkidle + 1.5s scroll), this is enough to fall through
             # cleanly when Wellfound's bot wall hides the listings.
+            #
+            # Fresh page per query: a wait_for timeout cancels mid-Playwright-
+            # op and corrupts the page (InvalidStateError on next use), so a
+            # throwaway page isolates the damage.
+            page = await context.new_page()
             try:
                 found = await asyncio.wait_for(
                     _scrape_one_query(page, query), timeout=45
@@ -70,6 +74,11 @@ async def scrape_wellfound(queries: list[str], _credentials: dict) -> list[dict]
                 print(f"[wellfound] '{query}' timed out after 45s")
             except Exception as e:
                 print(f"[wellfound] '{query}': {type(e).__name__}: {e}")
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
         await context.close()
         await browser.close()

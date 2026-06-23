@@ -52,16 +52,24 @@ async def scrape_instahyre(queries: list[str], credentials: dict) -> list[dict]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=LOW_MEM_CHROMIUM_ARGS)
         context = await new_stealth_context(browser)
-        page = await context.new_page()
 
         if credentials.get("username") and credentials.get("password"):
-            await _safe_login(page, credentials, "instahyre", f"{BASE}/login/")
+            login_page = await context.new_page()
+            try:
+                await _safe_login(login_page, credentials, "instahyre", f"{BASE}/login/")
+            finally:
+                await login_page.close()
 
         for query in queries:
             # 45s per query — Instahyre's search consistently returns 0 from
             # public (non-logged-in) scraping because their listings are
             # gated behind auth. Bounded short so we don't burn budget on a
             # source that historically produces nothing.
+            #
+            # Fresh page per query: a wait_for timeout cancels mid-Playwright-
+            # op and corrupts the page (InvalidStateError on next use), so a
+            # throwaway page isolates the damage.
+            page = await context.new_page()
             try:
                 found = await asyncio.wait_for(
                     _scrape_one_query(page, query), timeout=45
@@ -72,6 +80,11 @@ async def scrape_instahyre(queries: list[str], credentials: dict) -> list[dict]:
                 print(f"[instahyre] '{query}' timed out after 45s")
             except Exception as e:
                 print(f"[instahyre] '{query}': {type(e).__name__}: {e}")
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
 
         await context.close()
         await browser.close()
