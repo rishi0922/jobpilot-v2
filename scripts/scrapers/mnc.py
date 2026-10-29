@@ -224,14 +224,9 @@ HTML_COMPANIES = [
         "link_sels":    ["a"],
         "base":         "https://careers.makemytrip.com",
     },
-    {
-        "company": "Amazon",
-        "search_url": "https://amazon.jobs/en/search?base_query=product+manager&loc_query=India",
-        "title_sels":   ["h3.job-title", ".job-title"],
-        "loc_sels":     [".location-and-id .location", ".location"],
-        "link_sels":    ["a.job-link", "a"],
-        "base":         "https://amazon.jobs",
-    },
+    # Amazon moved to the API path — see _fetch_amazon_india(). The HTML
+    # amazon.jobs scrape consistently timed out at 30s; the JSON API is
+    # reliable and supports India-only filtering server-side.
 ]
 
 
@@ -332,6 +327,70 @@ async def _fetch_ashby(client: httpx.AsyncClient, name: str, slug: str) -> list[
     except Exception as e:
         print(f"[mnc:ashby:{name}] {type(e).__name__}: {e}")
         return []
+
+
+# ── Amazon (amazon.jobs public JSON API) ────────────────────────────────────
+#
+# Amazon exposes a clean JSON search endpoint — far more reliable than scraping
+# the amazon.jobs HTML page in Playwright (which consistently timed out at 30s
+# in production). We pass country=IND so the API itself returns only India
+# postings, then additionally guard on country_code == "IND" per job so a
+# stray non-India result can never slip through. Covers several role queries
+# and dedupes by job path.
+AMAZON_SEARCH_URL = "https://www.amazon.jobs/en/search.json"
+AMAZON_QUERIES = ("product manager", "program manager", "business analyst")
+AMAZON_PAGE_SIZE = 100  # API max per page
+
+async def _fetch_amazon_india(client: httpx.AsyncClient) -> list[dict]:
+    out: list[dict] = []
+    seen_paths: set[str] = set()
+    for q in AMAZON_QUERIES:
+        params = {
+            "base_query":   q,
+            "country":      "IND",   # server-side India filter
+            "result_limit": AMAZON_PAGE_SIZE,
+            "offset":       0,
+            "sort":         "recent",
+        }
+        try:
+            r = await client.get(AMAZON_SEARCH_URL, params=params, timeout=HTTP_TIMEOUT)
+            if r.status_code != 200:
+                print(f"[mnc:amazon] '{q}' HTTP {r.status_code}")
+                continue
+            data = r.json()
+        except Exception as e:
+            print(f"[mnc:amazon] '{q}' {type(e).__name__}: {e}")
+            continue
+
+        for j in data.get("jobs", []) or []:
+            # Strict India guard — never trust the query alone.
+            if (j.get("country_code") or "").upper() != "IND":
+                continue
+            title = (j.get("title") or "").strip()
+            if not title or not _is_relevant(title):
+                continue
+            path = j.get("job_path") or ""
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+
+            location = (j.get("normalized_location") or j.get("location") or "India").strip()
+            desc = _strip_html(
+                (j.get("description_short") or "")
+                + " "
+                + (j.get("basic_qualifications") or "")
+            )
+            out.append({
+                "title":       title,
+                "company":     "Amazon",
+                "location":    location,
+                "sourceUrl":   f"https://www.amazon.jobs{path}",
+                "salary":      None,
+                "description": desc or None,
+                "postedAt":    j.get("posted_date"),
+                "scrapedAt":   datetime.utcnow().isoformat(),
+            })
+    return out
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -470,15 +529,21 @@ async def scrape_mnc_sites() -> list[dict]:
                 print(f"[mnc:{vendor}:{name}] {len(jobs)} jobs")
             return jobs
 
-        results = await asyncio.gather(
-            *[_one(name, vendor, slug) for name, vendor, slug in API_COMPANIES],
-            return_exceptions=True,
-        )
+        tasks = [_one(name, vendor, slug) for name, vendor, slug in API_COMPANIES]
+        # Amazon via its own JSON API (India-only), run alongside the ATS calls.
+        tasks.append(_fetch_amazon_india(client))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         for r in results:
             if isinstance(r, list):
                 out.extend(r)
             else:
                 print(f"[mnc:api] task error: {type(r).__name__}: {r}")
+
+        # Amazon count log (gather result is the last entry)
+        amazon_jobs = results[-1] if results and isinstance(results[-1], list) else []
+        if amazon_jobs:
+            print(f"[mnc:amazon] {len(amazon_jobs)} India jobs")
 
     # ── HTML path: sequential with per-company timeout ──
     async with async_playwright() as p:
